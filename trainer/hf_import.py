@@ -11,6 +11,7 @@ from huggingface_hub import dataset_info
 
 SAMPLE_BYTES = 50 * 1024 * 1024
 DISK_RESERVE = 1024 * 1024 * 1024
+FULL_IMPORT_ROWS = 50_000  # Above this, recommend sampling: audits read at most 600 rows per subset anyway.
 
 
 def dataset_id(value):
@@ -23,6 +24,49 @@ def dataset_id(value):
     if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*", value) or ".." in value:
         raise ValueError("Use a dataset page URL or owner/dataset ID, not a file or viewer URL.")
     return value
+
+
+def dataset_overview(value, split, directory):
+    """Per-subset rows and download size from Hub metadata, plus a recommended import scope. Downloads no data."""
+    import fnmatch
+    import urllib.request
+    from urllib.parse import quote
+    repo = dataset_id(value)
+    info = dataset_info(repo, files_metadata=True)
+    card = info.card_data.to_dict() if info.card_data else {}
+    files = {item.rfilename: item.size or 0 for item in info.siblings or []}
+    viewer = {}
+    try:
+        with urllib.request.urlopen("https://datasets-server.huggingface.co/size?dataset=" + quote(repo, safe=""), timeout=20) as response:
+            viewer = {item["config"]: item for item in json.load(response)["size"]["splits"] if item["split"] == split}
+    except (OSError, ValueError, KeyError):
+        pass  # The viewer API is optional; gated or unconverted datasets report unknown sizes.
+    patterns = {}
+    for config in card.get("configs") or []:
+        for entry in config.get("data_files") or []:
+            if isinstance(entry, dict) and entry.get("split") == split:
+                patterns[config["config_name"]] = entry["path"] if isinstance(entry["path"], list) else [entry["path"]]
+    names = [config["config_name"] for config in card.get("configs") or []] or list(viewer) or get_dataset_config_names(repo, revision=info.sha) or [None]
+    subsets = []
+    for name in names:
+        sizes = viewer.get(name, {})
+        rows = sizes.get("estimated_num_rows") or sizes.get("num_rows")
+        matched = [size for path, size in files.items() if any(fnmatch.fnmatch(path, pattern) for pattern in patterns.get(name, []))]
+        if matched:
+            download = sum(matched)
+        elif sizes.get("num_rows") and rows:
+            download = round(sizes["num_bytes_parquet_files"] * rows / sizes["num_rows"])  # Viewer Parquet covers only a prefix of large subsets.
+        else:
+            download = None
+        subsets.append({"configuration": name, "rows": rows, "rowsEstimated": bool(sizes.get("estimated_num_rows")), "downloadBytes": download})
+    known = all(item["rows"] is not None and item["downloadBytes"] is not None for item in subsets)
+    total_rows = sum(item["rows"] or 0 for item in subsets)
+    total_bytes = sum(item["downloadBytes"] or 0 for item in subsets)
+    free = shutil.disk_usage(directory).free
+    full = known and total_rows <= FULL_IMPORT_ROWS and total_bytes + DISK_RESERVE <= free / 2
+    return {"datasetId": repo, "hubRevision": info.sha, "split": split, "license": card.get("license"), "subsets": subsets,
+            "sizesKnown": known, "totalRows": total_rows, "totalBytes": total_bytes, "freeBytes": free,
+            "recommendation": {"mode": "all"} if full else {"mode": "sample", "maxRows": 600}}
 
 
 def import_huggingface(value, configuration, split, max_rows, directory, *, progress=None, cancelled=lambda: False, import_id=None, resolved=None):
@@ -89,8 +133,8 @@ def import_huggingface(value, configuration, split, max_rows, directory, *, prog
     return {"source":"upload", "name":str(destination), "extension":"jsonl", "displayName":f"{repo} · {configuration or 'default'} · {split} · {scope}"[:255], "sourceUrl":"https://huggingface.co/datasets/" + repo, "importedRows":count, "hubConfig":configuration, "hubSplit":split, "hubRevision":revision, "sampleOnly":max_rows is not None}
 
 
-def import_all_subsets(value, split, directory, *, progress, cancelled, import_id):
-    """Keep each configuration separate and audit all of them before selection."""
+def import_all_subsets(value, split, directory, *, progress, cancelled, import_id, max_rows=None):
+    """Keep each configuration separate and audit all of them before selection. max_rows samples each subset."""
     from advisor import load_source, local_profile
     if cancelled():
         raise InterruptedError("Import cancelled.")
@@ -117,7 +161,7 @@ def import_all_subsets(value, split, directory, *, progress, cancelled, import_i
         report({})
         try:
             child_id = str(uuid.uuid5(uuid.UUID(import_id), json.dumps(config)))
-            ref = import_huggingface(repo, config, split, None, root, progress=report,
+            ref = import_huggingface(repo, config, split, max_rows, root, progress=report,
                                     cancelled=cancelled, import_id=child_id, resolved=(revision, configs))
             entry.update(dataset=ref, status="analyzing")
             report({})

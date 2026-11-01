@@ -3,8 +3,6 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {streamTrainer} from "./quality-proxy.mjs";
-
 try {process.loadEnvFile(fileURLToPath(new URL("./.env", import.meta.url)));} catch(error) {if(error.code!=="ENOENT") throw error;}
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -35,10 +33,6 @@ const server = createServer(async (request, response) => {
     return;
   }
   if (url.pathname.startsWith("/api/")) {
-    if (request.method === "GET" && /^\/api\/quality\/(versions|evaluations)\/[^/]+\/export$/.test(url.pathname)) {
-      await streamTrainer(trainerUrl + url.pathname.slice(4) + url.search, request, response);
-      return;
-    }
     try {
       const result = await callTrainer(url.pathname.slice(4) + url.search, request);
       response.writeHead(result.status, { "content-type": result.type }); response.end(result.body);

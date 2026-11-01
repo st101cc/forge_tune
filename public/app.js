@@ -282,14 +282,43 @@ function pollWorkflow(id) {
   workflowPollers.set(id, interval);
 }
 
+// The section the user just answered stays on screen, locked, until the workflow reaches its next step.
+let submittedStep = null;
+
+function lockedCopy(section) {
+  const copy = section.cloneNode(true);  // cloneNode keeps typed values and checkboxes; outerHTML would not.
+  [copy, ...copy.querySelectorAll("[id]")].forEach(node => node.removeAttribute("id"));
+  copy.querySelectorAll("input, textarea, select, button").forEach(control => control.disabled = true);
+  copy.inert = true;
+  copy.classList.add("submitted-step");
+  copy.insertAdjacentHTML("afterbegin", "<span class='pill complete submitted-badge'>Submitted</span>");
+  return copy;
+}
+
+function workflowWorking(workflow) {
+  const progress = workflow.progress;
+  const since = progress?.startedAt ? "since " + new Date(progress.startedAt * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) : "working";
+  // Steps that can't count their work (e.g. waiting on Compass) report no percent and get a moving bar.
+  const percent = Number.isFinite(progress?.percent) ? progress.percent : null;
+  const bar = percent === null ? "<div class='progress indeterminate'><i></i></div>" : "<div class='progress' role='progressbar' aria-valuemin='0' aria-valuemax='100' aria-valuenow='" + percent + "'><i style='width:" + percent + "%'></i></div>";
+  return "<div class='check-progress workflow-working' role='status' aria-live='polite'><div><span>" + escapeHtml(progress?.message || "Starting the next step…") + "</span><strong>" + (percent === null ? since : percent + "% · " + since) + "</strong></div>" + bar + "</div>";
+}
+
 function workflowAction(id, response, message) {
+  const source = document.activeElement?.closest?.("#app form, #app section");
+  const buttons = source ? [...source.querySelectorAll("button:not(:disabled)")] : [];
+  buttons.forEach(button => button.disabled = true);
   fetch("/api/workflow/runs/" + id + "/resume", {
     method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({response})
   }).then(result => {
     if (!result.ok) throw new Error();
-    pollWorkflow(id); renderWorkflow({...window.currentWorkflow, status:"queued", pendingAction:null});
+    submittedStep = source ? {workflowId:id, node:lockedCopy(source)} : null;
+    pollWorkflow(id); renderWorkflow({...window.currentWorkflow, status:"queued", pendingAction:null, progress:null});
     toast("Workflow resumed", message);
-  }).catch(() => toast("Could not resume workflow", "The trainer may be busy or offline."));
+  }).catch(() => {
+    buttons.forEach(button => button.disabled = false);
+    toast("Could not resume workflow", "The trainer may be busy or offline.");
+  });
 }
 
 function gradeDescription(grade) {
@@ -339,7 +368,7 @@ function modelPlanReview(pending) {
   return `<form id="model-plan" class="card body-pad experiment-form" data-compass="${escapeHtml(JSON.stringify(pending.compassOptions || []))}"><h2>Approve models to benchmark</h2><p>${escapeHtml(pending.message || "Approve or change the models to benchmark.")}</p>` +
     (proposal.note ? `<div class="notice">${escapeHtml(proposal.note)}</div>` : "") +
     (proposal.recommendation ? `<p>${escapeHtml(proposal.recommendation)}</p>` : "") +
-    `<div id="model-plan-rows">${rows}</div><label>Add a Compass model<input id="compass-add" list="compass-options" autocomplete="off" placeholder="Choose from the list"></label><datalist id="compass-options">${(pending.compassOptions || []).map(id => `<option value="${escapeHtml(id)}">`).join("")}</datalist><div><button class="button" type="button" id="add-compass">Add</button></div>` +
+    `<div id="model-plan-rows">${rows}</div><div id="compass-add-section"><label>Add a Compass model<select id="compass-add" disabled><option value="">Checking which Compass models respond…</option></select></label><p id="compass-add-status" role="status"></p><div><button class="button" type="button" id="add-compass" disabled>Add</button></div></div>` +
     (excluded ? `<h3>Not suggested</h3><ul class="resolution-list">${excluded}</ul>` : "") +
     (pending.privacyFlagged ? `<div class="notice" id="model-plan-privacy">This dataset was flagged for possible private data. Approving a list with Compass models confirms you are happy to send those questions to Compass.</div>` : "") +
     `<p id="model-plan-limit" role="status"></p><button class="button primary" type="button" id="approve-models">Approve and run</button> <button class="button" type="button" id="abort-workflow">Cancel</button></form>`;
@@ -358,12 +387,38 @@ function bindModelPlan(workflow) {
     if (privacy) privacy.style.display = compass ? "" : "none";
   };
   form.addEventListener("change", sync);
+  const select = form.querySelector("#compass-add"), status = form.querySelector("#compass-add-status");
+  const fillCompassOptions = models => {
+    const listed = new Set([...form.querySelectorAll("input[data-model]")].map(box => box.dataset.model));
+    const options = models.filter(id => JSON.parse(form.dataset.compass).includes(id) && !listed.has(id));
+    select.innerHTML = options.length ? '<option value="">Choose a model</option>' + options.map(id => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("") : '<option value="">No other Compass models responded</option>';
+    select.disabled = !options.length;
+    form.querySelector("#add-compass").disabled = true;
+  };
+  const loadCompassModels = async () => {
+    if (!document.body.contains(form)) return;
+    try {
+      const response = await fetch("/api/compass/available");
+      const result = await response.json().catch(() => ({}));
+      if (response.status === 503) { form.querySelector("#compass-add-section").innerHTML = "<p>Compass isn't configured on the trainer, so only your own models can be benchmarked.</p>"; return; }
+      if (!response.ok || result.status === "failed") throw new Error(result.error || result.detail || "The trainer could not reach Compass.");
+      if (result.status === "checking") {
+        status.textContent = result.total ? `Checking which Compass models respond: ${result.checked} of ${result.total}` : "Loading the Compass catalog…";
+        return setTimeout(loadCompassModels, 2000);
+      }
+      status.textContent = `Only models that answered a quick check are listed (checked ${new Date(result.checkedAt).toLocaleString()}).`;
+      fillCompassOptions(result.models);
+    } catch (error) {
+      select.innerHTML = '<option value="">Compass models unavailable</option>';
+      status.textContent = error.message;
+    }
+  };
+  loadCompassModels();
+  select.addEventListener("change", () => form.querySelector("#add-compass").disabled = !select.value);
   form.querySelector("#add-compass").onclick = async () => {
-    const input = form.querySelector("#compass-add"), add = form.querySelector("#add-compass"), id = input.value.trim();
-    if (!JSON.parse(form.dataset.compass).includes(id)) return toast("Model not available", "Choose a Compass model from the list.");
-    const existing = [...form.querySelectorAll("input[data-model]")].find(box => box.dataset.model === id);
-    if (existing) { existing.checked = true; input.value = ""; return sync(); }
-    // The catalog lists models this key cannot run, so ask Compass for one short answer first.
+    const input = select, add = form.querySelector("#add-compass"), id = input.value;
+    if (!id) return;
+    // Recheck: the list can be a few hours old.
     add.disabled = true; add.textContent = "Checking…";
     try {
       const response = await fetch("/api/compass/check?model=" + encodeURIComponent(id));
@@ -372,20 +427,16 @@ function bindModelPlan(workflow) {
       else if (!result.ok) toast("Compass can't run this model", result.message);
       else {
         form.querySelector("#model-plan-rows").insertAdjacentHTML("beforeend", modelPlanRow(id, "compass", "Added by you", true));
+        input.selectedOptions[0].remove();
         input.value = "";
         sync();
       }
     } catch {
       toast("Could not check the model", "The trainer may be busy or offline.");
     } finally {
-      add.disabled = false; add.textContent = "Add";
+      add.disabled = !input.value; add.textContent = "Add";
     }
   };
-  form.querySelector("#compass-add").addEventListener("keydown", event => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    form.querySelector("#add-compass").click();
-  });
   // No submit button, so Enter (on a checkbox or anywhere) can never approve; only a click on the button does.
   form.onsubmit = event => event.preventDefault();
   form.querySelector("#approve-models").onclick = () => workflowAction(workflow.id, {action:"approve", models:boxes().map(box => ({id:box.dataset.model, provider:box.dataset.provider}))}, "Models approved. Benchmarking is starting.");
@@ -430,9 +481,13 @@ function renderWorkflow(workflow) {
   else if (workflow.dataset?.hubRevision) action = "<div class='notice'>Full Hugging Face split: " + escapeHtml(workflow.dataset.importedRows) + " rows · subset " + escapeHtml(workflow.dataset.hubConfig || "default") + " · split " + escapeHtml(workflow.dataset.hubSplit || "train") + ". All imported rows are available to the training/evaluation split. The quality audit samples up to 600 rows.</div>" + action;
   action = datasetProfile(workflow.profile || workflow.state?.profile || pending?.profile) + action;
   const isDone = ["complete", "blocked", "cancelled", "failed"].includes(workflow.status);
+  const isRunning = workflow.status !== "waiting" && !isDone;
+  if (!isRunning || submittedStep?.workflowId !== workflow.id) submittedStep = null;
+  if (isRunning) action += (submittedStep ? "<div id='submitted-step-slot'></div>" : "") + workflowWorking(workflow);
   const comparison = workflow.comparison ? "<section class='card body-pad' style='margin-top:16px'><h2>Evaluation summary</h2>" + workflowComparison(workflow.comparison) + (workflow.status === "complete" && workflow.comparison.pairs?.length ? "<button class='button' id='evaluate-accuracy'>Run automatic evaluation</button><p>Grade saved answers on all recorded unseen questions. Training is not repeated.</p>" : "") + (workflow.accuracyError ? "<p role='alert'>" + escapeHtml(workflow.accuracyError) + "</p>" : "") + "</section>" : "";
   app.innerHTML = shell("LangGraph workflow", workflow.status === "waiting" ? "Your review is needed." : isDone ? "Workflow results are ready." : workflow.candidate_status === "verified" ? "Evaluating your fine-tune." : "ForgeTune is working.", workflow.status === "waiting" ? "The graph is checkpointed and waiting for your decision." : "Dataset analysis, prompt experiments, and optional fine-tuning are recorded in one resumable workflow.", "<button class='button' id='back-config'>← Datasets</button> <button class='button' id='update-dataset'>Update dataset</button>") +
-    steps(workflow.status === "complete" ? 3 : ["dataset_ready", "data_review", "blocker_resolution"].includes(pending?.type) ? 0 : pending?.type === "plan_approval" || Object.keys(workflow.training_runs || {}).length ? 2 : 1) + "<section class='card body-pad'><div class='section-head' style='padding:0 0 15px'><div><h2>" + escapeHtml(workflow.dataset?.displayName || workflow.state?.dataset?.displayName || "Dataset workflow") + "</h2><p>Task: " + escapeHtml(datasetTasks[workflow.profile?.classification?.task || workflow.state?.profile?.classification?.task] || "Dataset analysis") + " · Candidates: " + (workflow.approved_plan?.candidateCount || workflow.state?.max_candidates || 3) + "</p></div><span class='pill " + (workflow.status === "complete" ? "complete" : "") + "'>" + escapeHtml(workflow.status) + "</span></div><p style='color:var(--muted);font-size:11px;margin-top:12px'>" + (workflow.error ? escapeHtml(workflow.error) : workflow.status === "waiting" ? "No GPU work will start until this checkpoint is resolved." : isDone ? "All available workflow results have been persisted locally." : "The trainer will update this page automatically.") + "</p>" + (workflow.progress?.message ? "<div class='notice' role='status' style='margin-top:12px'><strong>" + escapeHtml(workflow.progress.message) + "</strong> · started " + new Date(workflow.progress.startedAt * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) + "</div>" : "") + "</section>" + action + comparison + (workflow.status === "complete" ? "<details class='card body-pad' style='margin-top:16px'><summary>Training and prompt/RAG checks</summary>" + workflowTools(workflow) + "</details>" : workflowTools(workflow)) + "</div>";
+    steps(workflow.status === "complete" ? 3 : ["dataset_ready", "data_review", "blocker_resolution"].includes(pending?.type) ? 0 : pending?.type === "plan_approval" || Object.keys(workflow.training_runs || {}).length ? 2 : 1) + "<section class='card body-pad'><div class='section-head' style='padding:0 0 15px'><div><h2>" + escapeHtml(workflow.dataset?.displayName || workflow.state?.dataset?.displayName || "Dataset workflow") + "</h2><p>Task: " + escapeHtml(datasetTasks[workflow.profile?.classification?.task || workflow.state?.profile?.classification?.task] || "Dataset analysis") + " · Candidates: " + (workflow.approved_plan?.candidateCount || workflow.state?.max_candidates || 3) + "</p></div><span class='pill " + (workflow.status === "complete" ? "complete" : "") + "'>" + escapeHtml(workflow.status) + "</span></div><p style='color:var(--muted);font-size:11px;margin-top:12px'>" + (workflow.error ? escapeHtml(workflow.error) : workflow.status === "waiting" ? "No GPU work will start until this checkpoint is resolved." : isDone ? "All available workflow results have been persisted locally." : "The trainer will update this page automatically.") + "</p></section>" + action + comparison + (workflow.status === "complete" ? "<details class='card body-pad' style='margin-top:16px'><summary>Training and prompt/RAG checks</summary>" + workflowTools(workflow) + "</details>" : workflowTools(workflow)) + "</div>";
+  if (submittedStep) document.querySelector("#submitted-step-slot").replaceWith(submittedStep.node);
   bindWorkflowTools(workflow);
   bindModelPlan(workflow);
   document.querySelector("#evaluate-accuracy")?.addEventListener("click", async event => {
@@ -640,13 +695,8 @@ function methodsPage() {
   document.querySelector("#methods-back").onclick = () => location.hash = "#/workspace";
 }
 function render() {
-  clearTimeout(qualityTimer);
   setNav(); const [page, id] = route().split("/");
-  if (page === "quality") qualityPage(id);
-  else if (page === "quality-evaluations") qualityEvaluations(id);
-  else if (page === "quality-comparisons") qualityComparisons(id, route().split("/")[2]);
-  else if (page === "quality-panels") qualityPanels(id, route().split("/"));
-  else if (page === "configure") configure();
+  if (page === "configure") configure();
   else if (page === "workflow") workflowPage(id);
   else if (page === "train") train(id);
   else if (page === "evaluate") evaluate(id);

@@ -22,6 +22,7 @@ from compass_client import CompassError, answer_cases, check_failure, configured
 from evaluator import DEFAULT_MODEL, comparable_evidence, evaluate_results
 from model_picker import MAX_COMPASS, MAX_LOCAL, built_in_proposal, propose_models
 from model_history import backfill_if_empty, recently_unavailable, record_benchmark, record_check_failure, summary_for
+from progress import ProgressFile
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -46,7 +47,6 @@ class WorkflowState(TypedDict, total=False):
     model_plan: dict[str, Any]
     model_options: dict[str, list[str]]
     compass_models: list[str]
-    quality_provenance: dict[str, Any] | None
     model_benchmark: dict[str, Any]
     analysis_limit: int
     task_description: str
@@ -156,10 +156,6 @@ def diagnose_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
             base = baseline.get(result.get("modelId"))
             if not base or result.get("status") != "complete" or trial.get("developmentIds") != trials[0].get("developmentIds"):
                 continue
-            if base.get('qualityReport') or result.get('qualityReport'):
-                from quality_training import quality_pair_compatible
-                if not quality_pair_compatible(base, result):
-                    continue
             overlap = result.get("meanTokenOverlap")
             base_overlap = base.get("meanTokenOverlap")
             fmt, base_fmt = result.get("formatValidRate"), base.get("formatValidRate")
@@ -206,7 +202,9 @@ def isolated_inference(function, *args, **kwargs):
     # A process boundary releases CUDA contexts as well as tensors after evaluation.
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
-    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
+    import truststore
+    # Spawned workers start without the API's certificate store patch, and may download models.
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"), initializer=truststore.inject_into_ssl) as pool:
         return pool.submit(function, *args, **kwargs).result()
 
 
@@ -473,9 +471,6 @@ def _compare_results(state: WorkflowState) -> dict[str, Any]:
         tuned_latency = _metric_value(result, "latencySeconds")
         base_quality, tuned_quality = _quality_value(base), _quality_value(result)
         same_metric = comparable_evidence(base, result)
-        if state.get('quality_provenance') or base.get('qualityReport') or result.get('qualityReport'):
-            from quality_training import quality_pair_compatible
-            same_metric = same_metric and quality_pair_compatible(base, result)
         same_examples = bool(base.get("evaluationIds")) and base.get("evaluationIds") == result.get("evaluationIds")
         quality_delta = tuned_quality - base_quality if same_metric and same_examples and base_quality is not None and tuned_quality is not None else None
         overlap_delta = tuned_overlap - base_overlap if tuned_overlap is not None and base_overlap is not None else None
@@ -531,12 +526,6 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
     """Build and compile the resumable ForgeTune graph."""
 
     async def run_inference(function, *args, **kwargs):
-        from quality_training import bounded_comparison
-        if function is baseline_compare and any(c.get('model', {}).get('localPath') for c in args[1]):
-            indices = kwargs.get('eval_indices', list(range(min(len(args[0]), args[2]))))
-            return [await asyncio.to_thread(bounded_comparison, services.data_root, args[0], indices, kwargs.get('task'), kwargs.get('instruction', ''), knowledge_documents=kwargs.get('knowledge_documents'), revision=c['model'].get('revision'), policy=c.get('qualityPolicy')) for c in args[1]]
-        if function is evaluate_tuned_run and args[1].get('model', {}).get('localPath'):
-            return await asyncio.to_thread(bounded_comparison, services.data_root, args[0], args[3], kwargs.get('task'), kwargs.get('instruction', ''), Path(args[2]) / 'adapter', kwargs.get('knowledge_documents'), revision=args[1]['model'].get('revision'), policy=args[1].get('qualityPolicy'))
         if services.isolate_inference:
             return await asyncio.to_thread(isolated_inference, function, *args, **kwargs)
         return await asyncio.to_thread(function, *args, **kwargs)
@@ -554,14 +543,16 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
     def clear_progress(state):
         progress_path(state).unlink(missing_ok=True)
 
-    async def grade_results(state, dataset, results, instruction="", knowledge_documents=None):
-        if state.get('quality_provenance'):
-            return results  # Bounded quality inference records separate deterministic scores; no implicit judge.
+    def counted_progress(state, message, base, total):
+        # Fills the page's bar from base to base + the phase's questions, out of total for the whole step.
+        return ProgressFile(progress_path(state), message, base, total)
+
+    async def grade_results(state, dataset, results, instruction="", knowledge_documents=None, on_progress=None):
         async with services.gpu_lock:
             return await run_inference(evaluate_results, dataset, results,
                 task=state.get("profile", {}).get("classification", {}).get("task", "assistant"),
                 model_id=state.get("evaluator_model", DEFAULT_MODEL), instruction=instruction,
-                knowledge_documents=knowledge_documents)
+                knowledge_documents=knowledge_documents, on_progress=on_progress)
 
     async def initialize(state: WorkflowState) -> dict[str, Any]:
         return {
@@ -768,17 +759,6 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
             manifest["evaluationIds"] = random.Random(state.get("split_seed", 42) + 2).sample(manifest["evalIndices"], min(len(manifest["evalIndices"]), limit))
             _persist_json(Path(state["split_manifest_path"]), manifest)
         memory = services.gpu_memory_gb()
-        if state.get('quality_provenance'):
-            from quality_training import pilot_candidate
-            try:
-                from quality_training import dataset_provenance
-                if dataset_provenance(services.data_root, state['dataset']) != state['quality_provenance']:
-                    raise ValueError('Dataset changed after quality review. Audit the new dataset and create an approved version before model experiments.')
-                candidate = pilot_candidate(memory)
-                candidate['qualityPolicy'] = state['quality_provenance']['policy']
-            except ValueError as error:
-                return {'candidates': [], 'status': 'blocked', 'errors': [str(error)]}
-            return {**({key: value.strip() for key, value in brief.items()} if 'task_description' in state else {}), 'analysis_limit': limit, 'candidates': [candidate], 'status': 'baseline'}
         ranked = rank_candidates(state["profile"], state.get("goal", "balanced"), memory)
         eligible = [item for item in ranked if not item.get("rejected")]
         if not eligible:
@@ -857,23 +837,25 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
             return {"status":"blocked","errors":["No development questions are available for model selection."]}
         hosted=state.get("compass_models",[])
         total=len(state["candidates"])+len(hosted)
+        # Each model answers then gets graded on every question: half the bar answering, half grading.
+        units=2*total*len(ids)
         try:
             async with services.gpu_lock:
                 for index,candidate in enumerate(state["candidates"],1):
-                    report_progress(state,f"Answering with {candidate['model']['id']} · model {index} of {total} · {len(ids)} questions")
+                    progress=counted_progress(state,f"Answering with {candidate['model']['id']} · model {index} of {total} · {len(ids)} questions",(index-1)*len(ids),units)
                     try:
-                        records=await run_inference(baseline_compare,dataset,[candidate],len(ids),eval_indices=ids,task=state["profile"]["classification"]["task"],instruction=INSTRUCTION,max_new_tokens=MAX_TOKENS,strict_context=True)
+                        records=await run_inference(baseline_compare,dataset,[candidate],len(ids),eval_indices=ids,task=state["profile"]["classification"]["task"],instruction=INSTRUCTION,max_new_tokens=MAX_TOKENS,strict_context=True,on_progress=progress)
                         record=records[0]
                     except Exception as error:
                         record={"status":"unavailable","message":str(error)[:300]}
                     results.append({**record,"modelId":candidate["model"]["id"],"provider":"local"})
             # Hosted answers need no GPU; build cases from the same development questions so compass_results accepts them.
             for index,model in enumerate(hosted,len(state["candidates"])+1):
-                report_progress(state,f"Answering with {model} on Compass · model {index} of {total} · {len(ids)} questions")
+                progress=counted_progress(state,f"Answering with {model} on Compass · model {index} of {total} · {len(ids)} questions",(index-1)*len(ids),units)
                 try:
                     rows=[dataset[i] for i in ids]
                     cases=[{"rowId":i,"messages":[m for m in evaluation_messages(row,INSTRUCTION)[0] if not (m["role"]=="system" and not m["content"].strip())]} for i,row in zip(ids,rows)]
-                    answers=await asyncio.to_thread(answer_cases,model,cases,max_tokens=MAX_TOKENS)
+                    answers=await asyncio.to_thread(answer_cases,model,cases,on_answer=progress,max_tokens=MAX_TOKENS)
                     job={"phase":"development","status":"complete","instruction":INSTRUCTION,"maxOutputTokens":MAX_TOKENS,"splitManifestId":state["split_manifest_id"],"models":[model],"cases":cases,"results":answers}
                     results+=compass_results(job,{"developmentIds":ids,"splitManifestId":state["split_manifest_id"]},rows)
                 except Exception as error:  # One failing hosted model must not discard the local answers, as for local models above.
@@ -884,8 +866,11 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                         if check:
                             row.update(unavailableDefinite=check.definite,checkMessage=str(check)[:300])
                     results.append(row)
-            report_progress(state,f"Grading the answers with {state.get('evaluator_model') or DEFAULT_MODEL}")
-            results = await grade_results(state, dataset, results, INSTRUCTION)
+            # Failed models have nothing to grade, so grading spans only the answers that came back.
+            grading=total*len(ids)
+            graded=sum(len(r.get("evaluationIds",[])) for r in results if r.get("status")=="complete")
+            progress=counted_progress(state,f"Grading the answers with {state.get('evaluator_model') or DEFAULT_MODEL}",grading,grading+graded)
+            results = await grade_results(state, dataset, results, INSTRUCTION, on_progress=progress)
         finally:
             clear_progress(state)
         results,prices=apply_review(results,{},{})
@@ -926,15 +911,19 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         instruction = state.get("prompt_instruction", "")
         label = state.get("progress_label") or ("Prompt test" if instruction else "Baseline test")
         models = ", ".join(c["model"]["id"] for c in candidates)
+        # Automatic analysis runs several tests in a row; each fills its share of one bar.
+        part, parts = state.get("progress_part", (1, 1))
+        answers = len(candidates) * len(indices)
+        start, units = (part - 1) * 2 * answers, parts * 2 * answers
         try:
-            report_progress(state, f"{label}: answering with {models} · {len(indices)} questions")
+            progress = counted_progress(state, f"{label}: answering with {models} · {len(indices)} questions", start, units)
             try:
                 async with services.gpu_lock:
-                    comparisons = await run_inference(baseline_compare, dataset, candidates, len(indices), eval_indices=indices, task=state.get("profile", {}).get("classification", {}).get("task"), instruction=instruction, knowledge_documents=state.get("knowledge_documents") if state.get("prompt_uses_rag") else None)
+                    comparisons = await run_inference(baseline_compare, dataset, candidates, len(indices), eval_indices=indices, task=state.get("profile", {}).get("classification", {}).get("task"), instruction=instruction, knowledge_documents=state.get("knowledge_documents") if state.get("prompt_uses_rag") else None, on_progress=progress)
             except Exception as error:
                 comparisons = [{"status": "unavailable", "message": str(error)[:300]}]
-            report_progress(state, f"{label}: grading the answers with {state.get('evaluator_model') or DEFAULT_MODEL}")
-            comparisons = await grade_results(state, dataset, comparisons, instruction, state.get("knowledge_documents") if state.get("prompt_uses_rag") else None)
+            progress = counted_progress(state, f"{label}: grading the answers with {state.get('evaluator_model') or DEFAULT_MODEL}", start + answers, units)
+            comparisons = await grade_results(state, dataset, comparisons, instruction, state.get("knowledge_documents") if state.get("prompt_uses_rag") else None, on_progress=progress)
         finally:
             clear_progress(state)
         trials = state.get("prompt_trials", []) + [{"instruction": instruction, "usesRag": bool(state.get("prompt_uses_rag")), "knowledgeDocuments": state.get("knowledge_documents", []) if state.get("prompt_uses_rag") else [], "results": comparisons, "developmentIds": indices}]
@@ -961,10 +950,10 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         prompts = [instruction, instruction + " Check your answer for missing requirements and contradictions before returning the final answer. If the supplied information is insufficient, state what is missing."]
         total = len(prompts) + bool(state.get("knowledge_documents"))
         for number, prompt in enumerate(prompts, 1):
-            result = await baseline_evaluate({**state, "prompt_trials": trials, "prompt_instruction": prompt, "prompt_uses_rag": False, "progress_label": f"Prompt test {number} of {total}"})
+            result = await baseline_evaluate({**state, "prompt_trials": trials, "prompt_instruction": prompt, "prompt_uses_rag": False, "progress_label": f"Prompt test {number} of {total}", "progress_part": (number, total)})
             trials = result["prompt_trials"]
         if state.get("knowledge_documents"):
-            result = await baseline_evaluate({**state, "prompt_trials":trials, "prompt_instruction":instruction, "prompt_uses_rag":True, "progress_label": f"Prompt test {total} of {total} (with references)"})
+            result = await baseline_evaluate({**state, "prompt_trials":trials, "prompt_instruction":instruction, "prompt_uses_rag":True, "progress_label": f"Prompt test {total} of {total} (with references)", "progress_part": (total, total)})
             trials = result["prompt_trials"]
         start = state.get("auto_trial_start", 0)
         recommendation = diagnose_trials(trials[start:])
@@ -1078,7 +1067,6 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                 "dataset": state["dataset"],
                 "testDataset": state.get("test_dataset"),
                 "baseModel": key,
-                "baseModelRevision": candidate['model'].get('revision'),
                 "parameterMethod": candidate["method"],
                 "hyperparameters": hp,
                 "splitManifestId": state["split_manifest_id"],

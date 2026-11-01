@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+import truststore
+# Trust the OS certificate store so downloads work behind TLS-inspecting proxies and antivirus.
+truststore.inject_into_ssl()
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -41,11 +45,8 @@ RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 DATASETS_ROOT.mkdir(parents=True, exist_ok=True)
 WORKFLOWS_ROOT.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="ForgeTune Local Trainer", version="0.1.0")
-from quality_api import install_quality_routes
-install_quality_routes(app, lambda: DATA_ROOT)
 queue_lock = asyncio.Lock()
 active_processes: dict[str, asyncio.subprocess.Process] = {}
-active_quality_training: dict[str, threading.Event] = {}
 active_workflows: dict[str, asyncio.Task] = {}
 active_evaluations: dict[str, asyncio.Task] = {}
 active_imports: dict[str, tuple[asyncio.Task, threading.Event]] = {}
@@ -79,7 +80,6 @@ class Hyperparameters(BaseModel):
 class RunRequest(BaseModel):
     dataset: DatasetRequest
     base_model: str
-    base_model_revision: str | None = Field(default=None, pattern='^[a-f0-9]{40}$')
     parameter_method: Literal["lora", "qlora"]
     hyperparameters: Hyperparameters = Field(default_factory=Hyperparameters)
     test_dataset: DatasetRequest | None = None
@@ -277,9 +277,10 @@ async def execute_import(record: dict, request: HuggingFaceRequest, stop: thread
         write_import(record)
     def run():
         try:
-            if request.mode == "all":
+            if request.mode in {"all", "sample"}:
                 record["result"] = import_all_subsets(request.url, request.split, DATASETS_ROOT,
-                                                    progress=progress, cancelled=stop.is_set, import_id=record["id"])
+                                                    progress=progress, cancelled=stop.is_set, import_id=record["id"],
+                                                    max_rows=request.max_rows if request.mode == "sample" else None)
             else:
                 record["result"] = import_huggingface(request.url, request.configuration, request.split, None, DATASETS_ROOT,
                                                      progress=progress, cancelled=stop.is_set, import_id=record["id"])
@@ -315,28 +316,45 @@ async def cancel_dataset_import(import_id: uuid.UUID) -> dict:
     return record
 
 
+@app.get("/datasets/huggingface/overview")
+async def huggingface_overview(url: str, split: str = "train") -> dict:
+    from hf_import import dataset_overview
+    if not url.strip() or len(url) > 2048 or not split.strip() or len(split) > 100:
+        raise HTTPException(422, "Enter a dataset URL or ID and a split.")
+    try:
+        return await asyncio.to_thread(dataset_overview, url, split.strip(), DATASETS_ROOT)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except Exception as error:
+        raise HTTPException(422, "Could not read this dataset from Hugging Face: " + str(error)[:500]) from error
+
+
 @app.post("/datasets/huggingface")
 async def huggingface_dataset(request: HuggingFaceRequest) -> dict:
     from hf_import import import_huggingface
-    if request.mode in {"full", "all"}:
+    if request.mode == "sample":
+        try:
+            result = await asyncio.to_thread(import_huggingface, request.url, request.configuration, request.split, request.max_rows, DATASETS_ROOT)
+        except Exception as error:
+            raise HTTPException(422, "Hugging Face import failed: " + str(error)[:500]) from error
+        if not result.get("requiresConfiguration"):
+            return result
+        # Several subsets: sample and audit each one in the background, then the user chooses.
+    else:
         from hf_import import dataset_id
         try:
             dataset_id(request.url)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
-        # ponytail: one full import per trainer process; use a durable queue for multi-worker deployments.
-        if active_imports:
-            raise HTTPException(409, "Another full dataset import is running. Wait for it or cancel it first.")
-        record = {"id": str(uuid.uuid4()), "status": "running", "createdAt": datetime.now(timezone.utc).isoformat(),
-                  "request": request.model_dump(), "importedRows": 0, "importedBytes": 0, "totalRows": None}
-        write_import(record)
-        stop = threading.Event()
-        active_imports[record["id"]] = (asyncio.create_task(execute_import(record, request, stop)), stop)
-        return JSONResponse(record, status_code=202)
-    try:
-        return await asyncio.to_thread(import_huggingface, request.url, request.configuration, request.split, request.max_rows, DATASETS_ROOT)
-    except Exception as error:
-        raise HTTPException(422, "Hugging Face import failed: " + str(error)[:500]) from error
+    # ponytail: one background import per trainer process; use a durable queue for multi-worker deployments.
+    if active_imports:
+        raise HTTPException(409, "Another dataset import is running. Wait for it or cancel it first.")
+    record = {"id": str(uuid.uuid4()), "status": "running", "createdAt": datetime.now(timezone.utc).isoformat(),
+              "request": request.model_dump(), "importedRows": 0, "importedBytes": 0, "totalRows": None}
+    write_import(record)
+    stop = threading.Event()
+    active_imports[record["id"]] = (asyncio.create_task(execute_import(record, request, stop)), stop)
+    return JSONResponse(record, status_code=202)
 
 
 class SubsetSelectionRequest(BaseModel):
@@ -401,6 +419,47 @@ async def compass_check(model: str = "") -> dict:
         raise HTTPException(422, "Choose a Compass model ID of at most 200 characters.")
     message = await asyncio.to_thread(compass_client.check_model, model)
     return {"ok": message is None, "message": message or ""}
+
+
+# The catalog lists models this key cannot run, so the add list shows only models that answered a quick check.
+COMPASS_AVAILABLE = DATA_ROOT / "compass-available.json"
+COMPASS_AVAILABLE_HOURS = 6
+compass_availability: dict = {"status": "idle", "models": [], "checked": 0, "total": 0, "checkedAt": None}
+try:
+    compass_availability.update(json.loads(COMPASS_AVAILABLE.read_text(encoding="utf-8")), status="complete")
+except (OSError, ValueError):
+    pass  # Never checked on this trainer, or the cache is unreadable; the next request rebuilds it.
+
+
+def check_compass_catalog() -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        catalog = compass_client.text_models()
+        compass_availability.update(status="checking", checked=0, total=len(catalog), error=None)
+        answered = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(compass_client.check_failure, model): model for model in catalog}
+            for future in as_completed(futures):
+                if future.result() is None:
+                    answered.append(futures[future])
+                compass_availability["checked"] += 1
+        result = {"models": sorted(answered), "checkedAt": datetime.now(timezone.utc).isoformat()}
+        COMPASS_AVAILABLE.write_text(json.dumps(result), encoding="utf-8")
+        compass_availability.update(result, status="complete")
+    except Exception as error:
+        compass_availability.update(status="failed", error=compass_client.safe_message(error))
+
+
+@app.get("/compass/available")
+async def compass_available(refresh: bool = False) -> dict:
+    if not compass_client.configured():
+        raise HTTPException(503, "Compass is not configured on the trainer.")
+    checked_at = compass_availability.get("checkedAt")
+    stale = not checked_at or (datetime.now(timezone.utc) - datetime.fromisoformat(checked_at)).total_seconds() > COMPASS_AVAILABLE_HOURS * 3600
+    if compass_availability["status"] != "checking" and (refresh or stale or compass_availability["status"] == "failed"):
+        compass_availability.update(status="checking", checked=0, total=0)
+        asyncio.get_running_loop().run_in_executor(None, check_compass_catalog)
+    return compass_availability
 
 
 @app.post("/advisor/connection-test")
@@ -475,29 +534,15 @@ async def run_training(run_id: str) -> None:
         record.update({"status": "running", "startedAt": datetime.now(timezone.utc).isoformat(), "framework": "Transformers + TRL + PEFT"})
         write_run(record)
         command = [sys.executable, "-u", str(ROOT / "train.py"), "--run-dir", str(run_path(run_id).parent)]
-        if record.get('qualityProvenance'):
-            from quality_pilot import run_with_pilot_budget
-            stop = threading.Event()
-            active_quality_training[run_id] = stop
-            try:
-                admission = {'load_mode': 'bnb4'} if record.get('config', {}).get('parameter_method') == 'qlora' else {}
-                budget = await asyncio.to_thread(run_with_pilot_budget, DATA_ROOT, [command], cancelled=stop.is_set, log_dir=run_path(run_id).parent, **admission)
-                record = read_run(run_id)
-                record.update(qualityBudget=budget, message=budget.get('message'))
-                write_run(record)
-                code = 0 if budget['status'] == 'complete' else 1
-            finally:
-                active_quality_training.pop(run_id, None)
-        else:
-            process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-            active_processes[run_id] = process
-            log_path = run_path(run_id).parent / "training.log"
-            with log_path.open("w", encoding="utf-8") as log:
-                while line := await process.stdout.readline():
-                    log.write(line.decode(errors="replace"))
-                    log.flush()
-            code = await process.wait()
-            active_processes.pop(run_id, None)
+        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        active_processes[run_id] = process
+        log_path = run_path(run_id).parent / "training.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            while line := await process.stdout.readline():
+                log.write(line.decode(errors="replace"))
+                log.flush()
+        code = await process.wait()
+        active_processes.pop(run_id, None)
         record = read_run(run_id)
         if record["status"] == "cancelled":
             return
@@ -519,23 +564,8 @@ async def run_training(run_id: str) -> None:
 
 @app.post("/runs", status_code=202)
 async def create_run(request: RunRequest) -> dict:
-    from quality_training import dataset_provenance
-    try:
-        provenance = dataset_provenance(DATA_ROOT, request.dataset.model_dump())
-    except (ValueError, KeyError, OSError) as error:
-        raise HTTPException(422, str(error)) from error
     if "14B" in request.base_model and request.parameter_method != "qlora":
         raise HTTPException(422, "14B models require QLoRA on the configured 24 GB GPU.")
-    quality_model = None
-    if provenance:
-        from quality_models import TAIDE_ID, get_model_status
-        if request.base_model != TAIDE_ID:
-            raise HTTPException(422, 'This quality pilot uses TAIDE; another model will not be substituted.')
-        if not request.base_model_revision:
-            raise HTTPException(422, 'Quality training requires the approved immutable model revision.')
-        quality_model = get_model_status(revision=request.base_model_revision)
-        if quality_model['status'] != 'ready':
-            raise HTTPException(422, quality_model['message'])
     if request.idempotency_key:
         for path in RUNS_ROOT.glob("*/run.json"):
             try:
@@ -559,8 +589,6 @@ async def create_run(request: RunRequest) -> dict:
         "idempotencyKey": request.idempotency_key,
         "splitManifestId": request.split_manifest_id,
         "splitManifestPath": request.split_manifest_path,
-        "qualityProvenance": provenance,
-        "qualityModel": quality_model,
     }
     write_run(record)
     asyncio.create_task(run_training(run_id))
@@ -592,7 +620,6 @@ async def submit_workflow_training(spec: dict) -> dict:
     request = RunRequest(
         dataset=DatasetRequest(**spec["dataset"]),
         base_model=spec["baseModel"],
-        base_model_revision=spec.get('baseModelRevision'),
         parameter_method=spec["parameterMethod"],
         hyperparameters=Hyperparameters(**spec["hyperparameters"]),
         test_dataset=DatasetRequest(**test_dataset) if test_dataset else None,
@@ -713,13 +740,6 @@ async def execute_workflow(workflow_id: str, resume_response: dict | None = None
 
 @app.post("/workflow/runs", status_code=202)
 async def create_workflow(request: WorkflowRequest) -> dict:
-    from quality_training import dataset_provenance
-    try:
-        provenance = dataset_provenance(DATA_ROOT, request.dataset.model_dump())
-    except (ValueError, KeyError, OSError) as error:
-        raise HTTPException(422, str(error)) from error
-    if provenance and request.cloud_assist:
-        raise HTTPException(422, "Quality workflows are local-only; cloud assistance is unavailable.")
     if request.knowledge_documents:
         from quality_probe import validate_documents
         try:
@@ -731,8 +751,7 @@ async def create_workflow(request: WorkflowRequest) -> dict:
     workflow_id = str(uuid.uuid4())
     initial_state = {
         "workflow_id": workflow_id,
-        "benchmark_selection": not bool(provenance),
-        "quality_provenance": provenance,
+        "benchmark_selection": True,
         "knowledge_documents": request.knowledge_documents,
         "analysis_limit": request.analysis_limit,
         "task_description": request.task_description,
@@ -798,8 +817,6 @@ async def get_workflow(workflow_id: str) -> dict:
 async def regrade_workflow(record: dict) -> None:
     """Add grades to saved final answers; never generate answers or train again."""
     state = record["state"]
-    if state.get('quality_provenance'):
-        return  # Quality cases require the independent, budgeted evaluation API.
     try:
         manifest = json.loads(Path(state["split_manifest_path"]).read_text(encoding="utf-8"))
         ref = manifest["evalDataset"]
@@ -824,8 +841,6 @@ async def regrade_workflow(record: dict) -> None:
 @app.post("/workflow/runs/{workflow_id}/evaluate", status_code=202)
 async def evaluate_workflow(workflow_id: uuid.UUID) -> dict:
     key = str(workflow_id)
-    if read_workflow(key).get('state', {}).get('quality_provenance'):
-        raise HTTPException(422, 'Quality workflows cannot use the legacy judge. Use independent quality evaluation; free-form correctness needs review.')
     if key in active_evaluations:
         return {"id": key, "status": "evaluating_accuracy"}
     record = read_workflow(key)
@@ -877,10 +892,6 @@ async def get_logs(run_id: str) -> dict:
 @app.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str) -> dict:
     record = read_run(run_id)
-    if record.get("managedBy"):
-        raise HTTPException(409, f"This run is managed by comparison {record['managedBy']}; cancel the comparison instead.")
-    if run_id in active_quality_training:
-        active_quality_training[run_id].set()
     process = active_processes.get(run_id)
     if process:
         process.terminate()

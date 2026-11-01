@@ -1,4 +1,4 @@
-param([string]$VmHost = 'gcp-dev', [switch]$CheckOnly, [switch]$SelfTest)
+param([string]$VmHost = '', [switch]$CheckOnly, [switch]$SelfTest)
 $ErrorActionPreference = 'Stop'
 function Has-Local24GbGpu($MemoryMiB) {
     return @($MemoryMiB | Where-Object { $_ -and [double]$_ -ge 24000 }).Count -gt 0
@@ -18,6 +18,7 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     $memory = & nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
     $localGpu = Has-Local24GbGpu $memory
 }
+if (-not $localGpu -and -not $VmHost) { throw 'No local NVIDIA GPU with at least 24 GB was found. Pass -VmHost <ssh-host> to use a remote GPU machine.' }
 $target = if ($localGpu) { 'local' } else { $VmHost }
 Write-Output "Backend target: $target"
 if ($CheckOnly) { return }
@@ -33,7 +34,7 @@ if ($localGpu) {
 } else {
     # The VM backend is installed separately; SSH never exposes its API publicly.
     & ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 $VmHost 'curl --fail --silent http://127.0.0.1:18000/hardware'
-    if ($LASTEXITCODE -ne 0) { throw 'VM backend is offline. Run /home/jupyter/dev-01/cherrie.chen/llm_fine_tune/trainer/start-vm-backend.sh on the VM.' }
+    if ($LASTEXITCODE -ne 0) { throw "Remote backend is offline. Run trainer/start-vm-backend.sh from the ForgeTune checkout on $VmHost." }
     if (-not (Get-NetTCPConnection -LocalPort 18000 -State Listen -ErrorAction SilentlyContinue)) {
         Start-Process ssh -ArgumentList @('-N','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3','-L','127.0.0.1:18000:127.0.0.1:18000',$VmHost) -WindowStyle Hidden -RedirectStandardOutput "$logPath/tunnel.out.log" -RedirectStandardError "$logPath/tunnel.err.log" | Out-Null
     }

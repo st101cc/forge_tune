@@ -7,8 +7,47 @@ let datasetImportPolling = false;
 let datasetSource = datasetImport ? "huggingface" : "file";
 let datasetUploadBusy = false;
 let datasetUploadError = "";
+let hfOverview = null;
 const datasetTasks = {assistant:"Assistant / question answering", writing:"Writing / completion", code:"Code generation", structured:"Structured output / JSON", classification:"Classification / labels"};
+const hfOverviewKey = () => (document.querySelector("#studio-hf")?.value.trim() || "") + "|" + (document.querySelector("#hf-split")?.value.trim() || "");
+const hfOverviewReady = () => !!hfOverview && hfOverview.key === hfOverviewKey();
+function formatBytes(bytes) {
+  if (bytes == null) return "unknown";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let index = 0;
+  while (bytes >= 1000 && index < units.length - 1) { bytes /= 1000; index++; }
+  return (index && bytes < 10 ? bytes.toFixed(1) : Math.round(bytes)) + " " + units[index];
+}
+function formatRows(rows) {
+  if (rows == null) return "unknown";
+  return rows >= 1e6 ? (rows / 1e6).toFixed(rows >= 1e7 ? 0 : 2) + " M" : rows >= 1e4 ? Math.round(rows / 1e3) + " K" : rows.toLocaleString();
+}
+function hfRecommendationReason(data) {
+  const rec = data.recommendation;
+  if (rec.mode === "all") return "Small enough to import in full: every row is saved and each subset is audited before you choose training subsets.";
+  const count = data.subsets.length;
+  const size = data.sizesKnown ? "A full import would download " + formatBytes(data.totalBytes) + " (" + formatRows(data.totalRows) + " rows)" + (data.totalBytes > data.freeBytes ? ", more than the trainer's free disk space" : data.totalBytes > data.freeBytes / 2 ? ", over half of the trainer's free disk space" : "") + ". " : "Hugging Face does not report the full size of every subset. ";
+  return size + "Audits read at most 600 rows per subset, so a sample gives the same analysis: about " + (count * rec.maxRows).toLocaleString() + " rows across " + count + " subset" + (count === 1 ? "" : "s") + ". Training uses the sampled rows; raise the row count (up to 10,000 per subset) for a larger training set.";
+}
+function renderHfOverview() {
+  const box = document.querySelector("#hf-overview");
+  if (!box) return;
+  box.hidden = !hfOverviewReady();
+  if (hfOverviewReady()) {
+    const data = hfOverview.data, rec = data.recommendation;
+    const license = [].concat(data.license || []).join(", ");
+    box.innerHTML = '<h4>Dataset overview</h4><p>' + escapeHtml(data.datasetId) + ' · ' + escapeHtml(data.split) + ' split' + (license ? ' · license: ' + escapeHtml(license) : '') + '</p>' +
+      '<div class="hf-overview-table"><table><thead><tr><th scope="col">Subset</th><th scope="col">Rows</th><th scope="col">Download</th></tr></thead><tbody>' +
+      data.subsets.map(item => '<tr><th scope="row">' + escapeHtml(item.configuration || "default") + '</th><td>' + (item.rowsEstimated ? "≈ " : "") + formatRows(item.rows) + '</td><td>' + formatBytes(item.downloadBytes) + '</td></tr>').join("") +
+      '</tbody><tfoot><tr><th scope="row">Total</th><td>' + (data.sizesKnown ? "≈ " + formatRows(data.totalRows) : "unknown") + '</td><td>' + (data.sizesKnown ? formatBytes(data.totalBytes) : "unknown") + '</td></tr></tfoot></table></div>' +
+      '<p class="hf-overview-free">' + formatBytes(data.freeBytes) + ' free on the trainer · ≈ marks estimated row counts</p>' +
+      '<div class="hf-recommendation"><strong>Recommended: ' + (rec.mode === "all" ? "Full dataset" : "Small sample, " + rec.maxRows.toLocaleString() + " rows per subset") + '</strong><p>' + escapeHtml(hfRecommendationReason(data)) + '</p></div>';
+  }
+  const submit = document.querySelector(".import-submit");
+  if (submit && !datasetUploadBusy) submit.textContent = datasetSubmitLabel();
+}
 function datasetSubmitLabel() {
+  if (datasetSource === "huggingface" && !hfOverviewReady()) return "Check dataset";
   if (datasetSource === "huggingface" && document.querySelector("#hf-mode")?.value === "all") return "Import Full Data";
   return datasetParent ? "Upload new version & analyze" : datasetSource === "huggingface" ? "Import Hugging Face sample & analyze" : datasetSource === "github" ? "Import from GitHub & analyze" : "Upload & auto-analyze";
 }
@@ -18,9 +57,7 @@ function setImportScope() {
   if (!fields) return;
   fields.hidden = !sample;
   document.querySelector("#hf-rows").disabled = !sample;
-  document.querySelector("#hf-config-options").hidden = !sample;
-  document.querySelector("#hf-config").disabled = !sample;
-  document.querySelector("#hf-scope-note").textContent = sample ? "First rows of the selected subset · up to 50 MB · not the full Hub dataset" : "All subsets of the chosen split · audit up to 600 rows per subset · choose training subsets after analysis";
+  document.querySelector("#hf-scope-note").textContent = sample ? "First rows of each subset · up to 50 MB each · choose training subsets after analysis" :"All subsets of the chosen split · audit up to 600 rows per subset · choose training subsets after analysis";
   document.querySelector(".import-submit").textContent = datasetSubmitLabel();
 }
 function saveDatasetImport() {
@@ -61,10 +98,7 @@ function renderDatasetImport() {
   if (!datasetImport) return;
   const job = datasetImport.job || {status:"running", importedRows:0, importedBytes:0};
   if (job.status === "needs_configuration") {
-    document.querySelector("#hf-mode").value = "sample";
-    setImportScope();
-    document.querySelector("#hf-config-options").innerHTML = '<label class="field" for="hf-config">Choose a dataset subset</label><select id="hf-config" required><option value="">Select a subset</option>' + job.result.configurations.map(name => '<option value="' + escapeHtml(name) + '">' + escapeHtml(name) + '</option>').join("") + '</select>';
-    document.querySelector("#dataset-upload-error").textContent = "This dataset has multiple subsets. Select one and import again.";
+    document.querySelector("#dataset-upload-error").textContent = "This dataset has multiple subsets. Import it again to analyze each one and choose afterwards.";
     clearDatasetImport();
     return;
   }
@@ -149,16 +183,17 @@ function updateDataset(workflow) {
 async function datasetStudio() {
   const github = datasetSource === "github", huggingface = datasetSource === "huggingface";
   app.innerHTML = shell("Your data, ready for what’s next", "Better data.<br><span class='accent-title'>Better models.</span>", "Bring your dataset. We’ll check its quality, understand its purpose, and ask you about anything that needs a human decision.", "").replace("class='page'", "class='page dataset-page'") +
-    `<div class="dataset-layout"><section class="card import-card"><div class="import-heading"><span class="section-number">01</span><div><h2>${datasetParent ? "Update dataset" : "Upload a dataset"}</h2><p>A new starting point for your next model.</p></div><span class="local-badge">LOCAL FIRST</span></div>${datasetParent ? `<div class="notice">New version of ${escapeHtml(datasetParent.name)}. The previous file, answers, and analysis will remain available.</div><button class="button" id="new-dataset">Start a separate dataset instead</button>` : ""}<div class="source-switch" role="group" aria-label="Dataset source"><button type="button" data-source="file" aria-pressed="${datasetSource === "file"}" ${datasetUploadBusy ? "disabled" : ""}>↑ Local file</button><button type="button" data-source="github" aria-pressed="${github}" ${datasetUploadBusy ? "disabled" : ""}>GitHub</button><button type="button" data-source="huggingface" aria-pressed="${huggingface}" ${datasetUploadBusy ? "disabled" : ""}>Hugging Face</button></div><form id="dataset-upload-form"><fieldset ${datasetUploadBusy ? "disabled" : ""}>${huggingface ? `<div class="github-entry"><span class="import-symbol">↗</span><h3>Import a Hugging Face dataset</h3><p>Import and analyze every subset first, then choose your training data. Each subset stays separate.</p><label class="field" for="studio-hf">Dataset URL or ID</label><input id="studio-hf" required maxlength="2048" placeholder="nvidia/Nemotron-Cascade-2-SFT-Data"><div class="form-row"><div id="hf-config-options" hidden><label class="field" for="hf-config">Subset / configuration (optional)</label><input id="hf-config" placeholder="Choose after checking dataset" disabled></div><div><label class="field" for="hf-split">Split</label><input id="hf-split" required value="train" maxlength="100"></div></div><label class="field" for="hf-mode">Import scope</label><select id="hf-mode"><option value="all">Full dataset (all subsets)</option><option value="sample">Small sample</option></select><div id="hf-sample-fields" hidden><label class="field" for="hf-rows">Maximum rows to import</label><input id="hf-rows" type="number" min="30" max="10000" value="600" required disabled></div><small id="hf-scope-note">All subsets of the chosen split · audit up to 600 rows per subset · choose training subsets after analysis</small></div>` : github ? `<div class="github-entry"><span class="import-symbol">↗</span><h3>Bring a dataset from GitHub</h3><p>Paste the link to a public data file. We’ll save a local copy and start the analysis.</p><label class="field" for="studio-github">GitHub file URL</label><input id="studio-github" type="url" required maxlength="2048" placeholder="https://github.com/owner/repo/blob/main/data.jsonl"><small>File links or raw.githubusercontent.com · up to 50 MB</small></div>` : `<div class="file-entry"><span class="import-symbol">↑</span><h3>Your dataset starts here</h3><p>Choose a file from your computer to get started.</p><label class="field" for="studio-file">Dataset file</label><input type="file" id="studio-file" accept=".csv,.jsonl,.parquet" required><div class="format-chips"><span>CSV</span><span>JSONL</span><span>PARQUET</span></div></div>`}<div class="cloud-choice"><label><input type="checkbox" id="dataset-cloud"><span><strong>Ask AI for a second opinion</strong><small>Optional cloud help for ambiguous data. Sends up to 20 locally redacted rows; you confirm the interpretation.</small></span></label></div><button class="button primary import-submit" type="submit">${datasetUploadBusy ? "Importing and starting analysis…" : datasetParent ? "Upload new version & analyze" : huggingface ? "Import Full Data" : github ? "Import from GitHub & analyze" : "Upload & auto-analyze"}<span aria-hidden="true">→</span></button><p class="import-footnote">Analysis first. Training only when you’re ready.</p></fieldset></form><div id="dataset-import" class="notice" hidden></div><div role="alert" id="dataset-upload-error">${escapeHtml(datasetUploadError)}</div></section><aside class="analysis-guide"><span class="eyebrow">A little guidance. A lot less guesswork.</span><h2>From raw data<br>to a clear next step.</h2><ol><li><span>01</span><div><h3>Inspect the essentials</h3><p>Schema, sampled row quality, duplicates, and language.</p></div></li><li><span>02</span><div><h3>Understand the task</h3><p>Suggest the likely purpose. Ask you when intent is unclear.</p></div></li><li><span>03</span><div><h3>Keep you in control</h3><p>Review the findings, update the data, or continue to model evaluation.</p></div></li></ol><div class="version-note"><span>↺</span><p><strong>Every version has a story.</strong>Updates preserve earlier files, findings, and your decisions.</p></div></aside></div><section class="card dataset-library"><div class="library-heading"><div><span class="eyebrow">Your workspace</span><h2>Dataset versions and analysis</h2></div><span class="library-count" id="dataset-count">— versions</span></div><div id="dataset-history" aria-live="polite"><p class="history-loading">Loading saved versions…</p></div></section></div>`;
+    `<div class="dataset-layout"><section class="card import-card"><div class="import-heading"><span class="section-number">01</span><div><h2>${datasetParent ? "Update dataset" : "Upload a dataset"}</h2><p>A new starting point for your next model.</p></div><span class="local-badge">LOCAL FIRST</span></div>${datasetParent ? `<div class="notice">New version of ${escapeHtml(datasetParent.name)}. The previous file, answers, and analysis will remain available.</div><button class="button" id="new-dataset">Start a separate dataset instead</button>` : ""}<div class="source-switch" role="group" aria-label="Dataset source"><button type="button" data-source="file" aria-pressed="${datasetSource === "file"}" ${datasetUploadBusy ? "disabled" : ""}>↑ Local file</button><button type="button" data-source="github" aria-pressed="${github}" ${datasetUploadBusy ? "disabled" : ""}>GitHub</button><button type="button" data-source="huggingface" aria-pressed="${huggingface}" ${datasetUploadBusy ? "disabled" : ""}>Hugging Face</button></div><form id="dataset-upload-form"><fieldset ${datasetUploadBusy ? "disabled" : ""}>${huggingface ? `<div class="github-entry"><span class="import-symbol">↗</span><h3>Import a Hugging Face dataset</h3><p>Import and analyze every subset first, then choose your training data. Each subset stays separate.</p><label class="field" for="studio-hf">Dataset URL or ID</label><input id="studio-hf" required maxlength="2048" placeholder="nvidia/Nemotron-Cascade-2-SFT-Data"><div class="form-row"><div><label class="field" for="hf-split">Split</label><input id="hf-split" required value="train" maxlength="100"></div></div><div id="hf-overview" class="hf-overview" aria-live="polite" hidden></div><label class="field" for="hf-mode">Import scope</label><select id="hf-mode"><option value="all">Full dataset (all subsets)</option><option value="sample">Small sample</option></select><div id="hf-sample-fields" hidden><label class="field" for="hf-rows">Maximum rows to import</label><input id="hf-rows" type="number" min="30" max="10000" value="600" required disabled></div><small id="hf-scope-note">All subsets of the chosen split · audit up to 600 rows per subset · choose training subsets after analysis</small></div>` : github ? `<div class="github-entry"><span class="import-symbol">↗</span><h3>Bring a dataset from GitHub</h3><p>Paste the link to a public data file. We’ll save a local copy and start the analysis.</p><label class="field" for="studio-github">GitHub file URL</label><input id="studio-github" type="url" required maxlength="2048" placeholder="https://github.com/owner/repo/blob/main/data.jsonl"><small>File links or raw.githubusercontent.com · up to 50 MB</small></div>` : `<div class="file-entry"><span class="import-symbol">↑</span><h3>Your dataset starts here</h3><p>Choose a file from your computer to get started.</p><label class="field" for="studio-file">Dataset file</label><input type="file" id="studio-file" accept=".csv,.jsonl,.parquet" required><div class="format-chips"><span>CSV</span><span>JSONL</span><span>PARQUET</span></div></div>`}<div class="cloud-choice"><label><input type="checkbox" id="dataset-cloud"><span><strong>Ask AI for a second opinion</strong><small>Optional cloud help for ambiguous data. Sends up to 20 locally redacted rows; you confirm the interpretation.</small></span></label></div><button class="button primary import-submit" type="submit">${datasetUploadBusy ? "Importing and starting analysis…" : datasetParent ? "Upload new version & analyze" : huggingface ? "Import Full Data" : github ? "Import from GitHub & analyze" : "Upload & auto-analyze"}<span aria-hidden="true">→</span></button><p class="import-footnote">Analysis first. Training only when you’re ready.</p></fieldset></form><div id="dataset-import" class="notice" hidden></div><div role="alert" id="dataset-upload-error">${escapeHtml(datasetUploadError)}</div></section><aside class="analysis-guide"><span class="eyebrow">A little guidance. A lot less guesswork.</span><h2>From raw data<br>to a clear next step.</h2><ol><li><span>01</span><div><h3>Inspect the essentials</h3><p>Schema, sampled row quality, duplicates, and language.</p></div></li><li><span>02</span><div><h3>Understand the task</h3><p>Suggest the likely purpose. Ask you when intent is unclear.</p></div></li><li><span>03</span><div><h3>Keep you in control</h3><p>Review the findings, update the data, or continue to model evaluation.</p></div></li></ol><div class="version-note"><span>↺</span><p><strong>Every version has a story.</strong>Updates preserve earlier files, findings, and your decisions.</p></div></aside></div><section class="card dataset-library"><div class="library-heading"><div><span class="eyebrow">Your workspace</span><h2>Dataset versions and analysis</h2></div><span class="library-count" id="dataset-count">— versions</span></div><div id="dataset-history" aria-live="polite"><p class="history-loading">Loading saved versions…</p></div></section></div>`;
   document.querySelectorAll("[data-source]").forEach(button => button.onclick = () => { datasetSource = button.dataset.source; datasetUploadError = ""; datasetStudio(); });
   document.querySelector("#new-dataset")?.addEventListener("click", () => {datasetParent = null; datasetStudio();});
   document.querySelector("#hf-mode")?.addEventListener("change", setImportScope);
+  document.querySelectorAll("#studio-hf, #hf-split").forEach(input => input.addEventListener("input", renderHfOverview));
   if (huggingface && datasetImport?.request) {
     document.querySelector("#studio-hf").value = datasetImport.request.url;
-    document.querySelector("#hf-config").value = datasetImport.request.configuration || "";
     document.querySelector("#hf-split").value = datasetImport.request.split;
   }
   setImportScope();
+  renderHfOverview();
   renderDatasetImport();
   if (datasetImport) pollDatasetImport();
   document.querySelector("#dataset-upload-form").onsubmit = async event => {
@@ -172,12 +207,25 @@ async function datasetStudio() {
     const parent = datasetParent;
     datasetUploadBusy = true; datasetUploadError = "";
     event.target.querySelector("fieldset").disabled = true;
-    event.target.querySelector("button[type=submit]").textContent = "Uploading and starting analysis…";
+    const checking = !!hfUrl && !hfOverviewReady();
+    event.target.querySelector("button[type=submit]").textContent = checking ? "Checking dataset…" : "Uploading and starting analysis…";
+    document.querySelector("#dataset-upload-error").textContent = "";
     try {
       let upload;
+      if (checking) {
+        // Overview first: sizes come from Hub metadata, so the user picks a scope before anything downloads.
+        const key = hfOverviewKey();
+        const response = await fetch("/api/datasets/huggingface/overview?url=" + encodeURIComponent(hfUrl) + "&split=" + encodeURIComponent(document.querySelector("#hf-split").value.trim()));
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Could not check this dataset.");
+        hfOverview = {key, data};
+        document.querySelector("#hf-mode").value = data.recommendation.mode;
+        if (data.recommendation.maxRows) document.querySelector("#hf-rows").value = data.recommendation.maxRows;
+        return;
+      }
       if (hfUrl) {
         const mode = document.querySelector("#hf-mode").value;
-        const request = {url:hfUrl, configuration:mode === "all" ? null : document.querySelector("#hf-config").value.trim() || null, split:document.querySelector("#hf-split").value.trim(), mode};
+        const request = {url:hfUrl, configuration:null, split:document.querySelector("#hf-split").value.trim(), mode};
         if (request.mode === "sample") request.max_rows = Number(document.querySelector("#hf-rows").value);
         upload = await fetch("/api/datasets/huggingface", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(request)});
         if (upload.status === 202) {
@@ -195,11 +243,6 @@ async function datasetStudio() {
       }
       const dataset = await upload.json();
       if (!upload.ok) throw new Error(typeof dataset.detail === "string" ? dataset.detail : "Dataset upload failed.");
-      if (dataset.requiresConfiguration) {
-        document.querySelector("#hf-config-options").innerHTML = `<label class="field" for="hf-config">Choose a dataset subset</label><select id="hf-config" required><option value="">Select a subset</option>${dataset.configurations.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}</select>`;
-        document.querySelector("#dataset-upload-error").textContent = "This dataset has multiple subsets. Select one and import again.";
-        return;
-      }
       await analyzeImportedDataset(dataset, parent, cloudAssist);
     } catch (error) {
       datasetUploadError = error.message || "Start the trainer and try again.";
@@ -209,6 +252,8 @@ async function datasetStudio() {
       datasetUploadBusy = false;
       const fieldset = document.querySelector("#dataset-upload-form fieldset");
       if (fieldset) { fieldset.disabled = !!datasetImport; fieldset.querySelector("button[type=submit]").textContent = datasetSubmitLabel(); }
+      setImportScope();
+      renderHfOverview();
       renderDatasetImport();
     }
   };

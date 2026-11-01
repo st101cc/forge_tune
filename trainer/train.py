@@ -74,21 +74,15 @@ def manifest_training_split(dataset, manifest):
 
 
 def main() -> None:
+    # Trust the OS certificate store so model downloads work behind TLS-inspecting proxies and antivirus.
+    import truststore
+    truststore.inject_into_ssl()
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
     args = parser.parse_args()
     run_dir = Path(args.run_dir)
     run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     config = run["config"]
-    quality_model = run.get('qualityModel')
-    if run.get('qualityProvenance'):
-        from quality_models import get_model_status
-        if not quality_model:
-            raise ValueError('Quality training requires pinned local model provenance.')
-        verified = get_model_status(config['base_model'], revision=quality_model['revision'])
-        if verified['status'] != 'ready':
-            raise ValueError(verified['message'])
-        config['base_model'] = verified['path']
     method = config["parameter_method"]
     if method not in {"lora", "qlora"}:
         raise ValueError("Unsupported parameter method")
@@ -135,7 +129,7 @@ def main() -> None:
     framework = "Transformers + TRL + PEFT"
     trainer_adapter = None
     try:
-        if method != "qlora" or quality_model:
+        if method != "qlora":
             raise ImportError("Unsloth fast path is only used for QLoRA.")
         from unsloth import FastLanguageModel
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -147,14 +141,14 @@ def main() -> None:
         )
         framework = "Unsloth + TRL + PEFT"
     except (ImportError, ModuleNotFoundError):
-        tokenizer = AutoTokenizer.from_pretrained(config["base_model"], use_fast=True, **({'local_files_only': True, 'trust_remote_code': False} if quality_model else {}))
+        tokenizer = AutoTokenizer.from_pretrained(config["base_model"], use_fast=True)
         tokenizer.pad_token = tokenizer.eos_token
         quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
         if not torch.cuda.is_available():
             raise RuntimeError("Training requires a CUDA GPU.")
         device = max(range(torch.cuda.device_count()), key=lambda i: torch.cuda.mem_get_info(i)[0])
         torch.cuda.set_device(device)
-        base = AutoModelForCausalLM.from_pretrained(config["base_model"], quantization_config=quantization, device_map={"": device}, torch_dtype=torch.float16, **({'local_files_only': True, 'trust_remote_code': False} if quality_model else {}))
+        base = AutoModelForCausalLM.from_pretrained(config["base_model"], quantization_config=quantization, device_map={"": device}, torch_dtype=torch.float16)
         base.config.use_cache = False
         model = base
         trainer_adapter = adapter
