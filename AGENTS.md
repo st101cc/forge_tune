@@ -5,8 +5,8 @@
 The working application lives at the repository root:
 
 - `index.html` is the app shell; `public/` holds the browser UI's `*.js` and `*.css` files.
-- `server.mjs` and its `quality-proxy.mjs` helper provide the Node.js web server.
-- `test/` holds the Node test scripts (`test-*.cjs`); `test-quality-stream.mjs` stays at the repository root alongside the server module it exercises.
+- `server.mjs` provides the Node.js web server.
+- `test/` holds the Node test scripts (`test-*.cjs`).
 - `trainer/` contains the FastAPI/LangGraph Python service, training code, imports, evaluation, and Python tests.
 - `validation/` and the Markdown reports hold small validation fixtures and experiment notes.
 - `trainer/data/` and `.forge-data/` are runtime artifacts; do not commit generated databases, logs, models, or adapters.
@@ -18,7 +18,6 @@ From the repository root:
 ```powershell
 npm start
 python -m pytest trainer -q
-node --test test-quality-stream.mjs
 node test/test-datasets.cjs
 ```
 

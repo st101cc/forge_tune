@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from datasets import Dataset, load_dataset
 
@@ -407,6 +407,7 @@ def baseline_compare(
     knowledge_documents: list[dict[str, Any]] | None = None,
     max_new_tokens: int = 512,
     strict_context: bool = False,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Run small local base-model comparisons. This intentionally loads one model at a time."""
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -415,15 +416,16 @@ def baseline_compare(
     selected_indices = list(eval_indices)[:limit] if eval_indices is not None else list(range(len(dataset)))[:limit]
     rows = dataset.select(selected_indices)
     results = []
-    for candidate in candidates:
+    for number, candidate in enumerate(candidates):
+        if on_progress:
+            on_progress(number * len(rows), len(candidates) * len(rows))
         started = time.perf_counter()
         model = inputs = loss_output = output = None
         try:
-            local_path = candidate['model'].get('localPath')
-            tokenizer = AutoTokenizer.from_pretrained(local_path or candidate["model"]["id"], use_fast=True, **({'local_files_only': True, 'trust_remote_code': False} if local_path else {}))
+            tokenizer = AutoTokenizer.from_pretrained(candidate["model"]["id"], use_fast=True)
             tokenizer.pad_token = tokenizer.eos_token
             quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4") if candidate["method"] == "qlora" else None
-            model = AutoModelForCausalLM.from_pretrained(local_path or candidate["model"]["id"], quantization_config=quant, device_map="auto", **({'local_files_only': True, 'trust_remote_code': False} if local_path else {}))
+            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map="auto")
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
             references, predictions = [], []
@@ -453,6 +455,8 @@ def baseline_compare(
                     except (TypeError, json.JSONDecodeError):
                         format_scores.append(0.0)
                 samples.append({"retrieved": retrieved, "rowId": selected_indices[index], "input": prompt, "reference": reference, "baseOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": len(tokenizer.encode(prompt)) > 4096, "hitTokenLimit": len(output[0]) - inputs["input_ids"].shape[1] >= max_new_tokens})
+                if on_progress:
+                    on_progress(number * len(rows) + index + 1, len(candidates) * len(rows))
             eval_loss = round(sum(losses) / len(losses), 4) if losses else None
             results.append({**task_quality(list(rows), references, predictions, selected_indices), "modelId": candidate["model"]["id"], "status": "complete", "examples": len(rows), "evaluationIds": selected_indices, "eval_loss": eval_loss, "perplexity": round(math.exp(eval_loss), 3) if eval_loss is not None and eval_loss < 700 else None, "meanTokenOverlap": round(sum(scores) / len(scores), 3) if scores else None, "formatValidRate": round(sum(format_scores) / len(format_scores), 3) if format_scores else None, "inferenceSeconds": sum(answer_seconds), "meanLatencySeconds": sum(answer_seconds) / len(answer_seconds) if answer_seconds else None, "maxOutputTokens": max_new_tokens, "latencySeconds": round(time.perf_counter() - started, 1), "samples": samples})
         except Exception as error:
@@ -483,13 +487,12 @@ def evaluate_tuned_run(
 
     model_id = candidate["model"]["id"]
     method = candidate.get("method", "qlora")
-    local_path = candidate['model'].get('localPath')
-    tokenizer = AutoTokenizer.from_pretrained(local_path or model_id, use_fast=True, **({'local_files_only': True, 'trust_remote_code': False} if local_path else {}))
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
     quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4") if method == "qlora" else None
     base = model = inputs = loss_output = output = None
     try:
-        base = AutoModelForCausalLM.from_pretrained(local_path or model_id, quantization_config=quantization, device_map="auto", **({'local_files_only': True, 'trust_remote_code': False} if local_path else {}))
+        base = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map="auto")
         model = PeftModel.from_pretrained(base, str(run_dir / "adapter"))
         rows_dataset = test_dataset if test_dataset is not None else dataset
         rows = rows_dataset.select(list(eval_indices))

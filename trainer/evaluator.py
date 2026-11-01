@@ -93,15 +93,19 @@ def parse_grade(raw):
     return {"verdict": data["verdict"], "reason": data["reason"].strip()[:600]}
 
 
-def evaluate_results(dataset, results, task="assistant", model_id=None, instruction="", knowledge_documents=None, judge=None):
+def evaluate_results(dataset, results, task="assistant", model_id=None, instruction="", knowledge_documents=None, judge=None, on_progress=None):
     """Grade every recorded answer, preserving exact metrics when they cover all rows."""
+    counts = [len(r.get("evaluationIds", [])) if r.get("status") == "complete" else 0 for r in results]
+    report = (lambda done: on_progress(done, sum(counts))) if on_progress else (lambda done: None)
     model_id = model_id or os.environ.get("EVALUATOR_MODEL") or DEFAULT_MODEL
     evaluator_id = hashlib.sha256(json.dumps([VERSION, model_id, SYSTEM, RUBRICS], sort_keys=True).encode()).hexdigest()[:16]
     local = LocalJudge(model_id) if judge is None else None
     grade_with = judge or local
     scored, unavailable = [], None
     try:
-        for original in results:
+        for number, original in enumerate(results):
+            finished = sum(counts[:number])
+            report(finished)
             result = {**original, "samples": [dict(s) for s in original.get("samples", [])]}
             scored.append(result)
             if result.get("status") != "complete":
@@ -162,6 +166,7 @@ def evaluate_results(dataset, results, task="assistant", model_id=None, instruct
                             grade["reason"] = unavailable
                 sample["grade"] = grade
                 grades.append(grade)
+                report(finished + len(grades))
             evaluated = sum(g["verdict"] != "abstain" for g in grades)
             passed = sum(g["verdict"] == "pass" for g in grades)
             evidence.update(status="estimated" if evaluated == len(ids) else "needs_review", coverage=evaluated / len(ids),
