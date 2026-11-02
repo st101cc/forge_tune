@@ -361,3 +361,7 @@ Install [Ollama](https://ollama.com/) first.
 The tested trainer uses TRL 0.22 and Transformers 4.x. `trainer/requirements-accelerated.txt`
 adds the optional Unsloth QLoRA fast path; ForgeTune falls back to Transformers + TRL + PEFT
 when it is not installed.
+
+## License
+
+[MIT](LICENSE)
