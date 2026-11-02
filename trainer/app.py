@@ -668,6 +668,16 @@ async def initialize_workflow_checkpointer() -> None:
                 partial.unlink()
             record.update(status="interrupted", error="Trainer restarted before this import finished. Start the import again.")
             write_import(record)
+    # Nothing drives a run that was mid-step when the trainer stopped; mark it so it can be resumed from its checkpoint.
+    for path in WORKFLOWS_ROOT.glob("*/workflow.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("status") in {"running", "queued"}:
+            record.update(status="interrupted", pendingAction=None, error="The trainer restarted before this step finished.")
+            write_workflow(record)
+            (path.parent / "progress.json").unlink(missing_ok=True)
     if AsyncSqliteSaver is None:
         return
     try:
@@ -697,14 +707,17 @@ def _interrupt_value(result: dict) -> dict | None:
     return value if isinstance(value, dict) else {"type": "human_review", "message": str(value)}
 
 
-async def execute_workflow(workflow_id: str, resume_response: dict | None = None) -> None:
+async def execute_workflow(workflow_id: str, resume_response: dict | None = None, from_checkpoint: bool = False) -> None:
     record = read_workflow(workflow_id)
     record["status"] = "running"
     record["pendingAction"] = None
     write_workflow(record)
     config = {"configurable": {"thread_id": workflow_id}}
     try:
-        if resume_response is None:
+        if from_checkpoint:
+            # No input: LangGraph reruns the step that never finished, keeping every step before it.
+            result = await workflow_graph.ainvoke(None, config=config)
+        elif resume_response is None:
             result = await workflow_graph.ainvoke(record["state"], config=config)
         else:
             result = await workflow_graph.ainvoke(Command(resume=resume_response), config=config)
@@ -811,7 +824,31 @@ async def get_workflow(workflow_id: str) -> dict:
             if context_path.exists():
                 run["trainingContext"] = json.loads(context_path.read_text(encoding="utf-8"))
             training_records.append(run)
-    return public_workflow({**state, **record, "state":state, "trainingRecords":training_records, "progress":progress})
+    return public_workflow({**state, **record, "state":state, "trainingRecords":training_records, "progress":progress, "resumable":await workflow_resumable(workflow_id, record)})
+
+
+async def workflow_resumable(workflow_id: str, record: dict) -> bool:
+    if record.get("status") not in {"interrupted", "failed"} or workflow_id in active_workflows:
+        return False
+    try:
+        snapshot = await workflow_graph.aget_state({"configurable": {"thread_id": workflow_id}})
+    except Exception:
+        return False  # No checkpoint store, e.g. the in-memory fallback after a restart.
+    return bool(getattr(snapshot, "next", ()))
+
+
+@app.post("/workflow/runs/{workflow_id}/continue", status_code=202)
+async def continue_workflow(workflow_id: str) -> dict:
+    record = read_workflow(workflow_id)
+    if workflow_id in active_workflows:
+        raise HTTPException(409, "Workflow is already running.")
+    if not await workflow_resumable(workflow_id, record):
+        raise HTTPException(409, "This run has no unfinished step to resume. Start a new run instead.")
+    record["status"] = "queued"
+    record.pop("error", None)
+    write_workflow(record)
+    active_workflows[workflow_id] = asyncio.create_task(execute_workflow(workflow_id, from_checkpoint=True))
+    return public_workflow(record)
 
 
 async def regrade_workflow(record: dict) -> None:

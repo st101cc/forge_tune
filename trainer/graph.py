@@ -198,13 +198,24 @@ class WorkflowServices:
     isolate_inference: bool = False
 
 
+def _start_inference_worker() -> None:
+    import multiprocessing
+    import os
+    import threading
+    import truststore
+    # Spawned workers start without the API's certificate store patch, and may download models.
+    truststore.inject_into_ssl()
+    # A killed trainer leaves its worker blocked on the task queue, holding GPU memory; exit as soon as the parent is gone.
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        threading.Thread(target=lambda: (parent.join(), os._exit(1)), daemon=True).start()
+
+
 def isolated_inference(function, *args, **kwargs):
     # A process boundary releases CUDA contexts as well as tensors after evaluation.
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
-    import truststore
-    # Spawned workers start without the API's certificate store patch, and may download models.
-    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"), initializer=truststore.inject_into_ssl) as pool:
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"), initializer=_start_inference_worker) as pool:
         return pool.submit(function, *args, **kwargs).result()
 
 

@@ -274,7 +274,7 @@ function pollWorkflow(id) {
       const workflow = await response.json();
       // Rebuilding unchanged data collapses open sections and moves the scroll position.
       if (route() === "workflow/" + id && JSON.stringify(workflow) !== JSON.stringify(window.currentWorkflow)) renderWorkflow(workflow);
-      if (["waiting", "complete", "blocked", "cancelled", "failed"].includes(workflow.status)) {
+      if (["waiting", "complete", "blocked", "cancelled", "failed", "interrupted"].includes(workflow.status)) {
         clearInterval(interval); workflowPollers.delete(id);
       }
     } catch { /* The trainer may be restarting; keep polling. */ }
@@ -484,12 +484,13 @@ function renderWorkflow(workflow) {
   if (workflow.dataset?.sampleOnly) action = "<div class='notice'>Hugging Face sample: " + escapeHtml(workflow.dataset.importedRows) + " rows · subset " + escapeHtml(workflow.dataset.hubConfig || "default") + " · split " + escapeHtml(workflow.dataset.hubSplit || "train") + ". Analysis and training use this local sample, not the full Hub dataset.</div>" + action;
   else if (workflow.dataset?.hubRevision) action = "<div class='notice'>Full Hugging Face split: " + escapeHtml(workflow.dataset.importedRows) + " rows · subset " + escapeHtml(workflow.dataset.hubConfig || "default") + " · split " + escapeHtml(workflow.dataset.hubSplit || "train") + ". All imported rows are available to the training/evaluation split. The quality audit samples up to 600 rows.</div>" + action;
   action = datasetProfile(workflow.profile || workflow.state?.profile || pending?.profile) + action;
-  const isDone = ["complete", "blocked", "cancelled", "failed"].includes(workflow.status);
+  const isDone = ["complete", "blocked", "cancelled", "failed", "interrupted"].includes(workflow.status);
   const isRunning = workflow.status !== "waiting" && !isDone;
   if (!isRunning || submittedStep?.workflowId !== workflow.id) submittedStep = null;
   if (isRunning) action += (submittedStep ? "<div id='submitted-step-slot'></div>" : "") + workflowWorking(workflow);
+  if (workflow.resumable) action += "<section class='card body-pad'><h2>Resume this run</h2><p>Finished steps are kept. The step that stopped starts again from its beginning, so a model benchmark reruns every model.</p><button class='button primary' id='continue-workflow'>Resume</button></section>";
   const comparison = workflow.comparison ? "<section class='card body-pad' style='margin-top:16px'><h2>Evaluation summary</h2>" + workflowComparison(workflow.comparison) + (workflow.status === "complete" && workflow.comparison.pairs?.length ? "<button class='button' id='evaluate-accuracy'>Run automatic evaluation</button><p>Grade saved answers on all recorded unseen questions. Training is not repeated.</p>" : "") + (workflow.accuracyError ? "<p role='alert'>" + escapeHtml(workflow.accuracyError) + "</p>" : "") + "</section>" : "";
-  app.innerHTML = shell("LangGraph workflow", workflow.status === "waiting" ? "Your review is needed." : isDone ? "Workflow results are ready." : workflow.candidate_status === "verified" ? "Evaluating your fine-tune." : "ForgeTune is working.", workflow.status === "waiting" ? "The graph is checkpointed and waiting for your decision." : "Dataset analysis, prompt experiments, and optional fine-tuning are recorded in one resumable workflow.", "<button class='button' id='back-config'>← Datasets</button> <button class='button' id='update-dataset'>Update dataset</button>") +
+  app.innerHTML = shell("LangGraph workflow", workflow.status === "waiting" ? "Your review is needed." : workflow.status === "interrupted" ? "This run stopped before it finished." : isDone ? "Workflow results are ready." : workflow.candidate_status === "verified" ? "Evaluating your fine-tune." : "ForgeTune is working.", workflow.status === "waiting" ? "The graph is checkpointed and waiting for your decision." : "Dataset analysis, prompt experiments, and optional fine-tuning are recorded in one resumable workflow.", "<button class='button' id='back-config'>← Datasets</button> <button class='button' id='update-dataset'>Update dataset</button>") +
     steps(workflow.status === "complete" ? 3 : ["dataset_ready", "data_review", "blocker_resolution"].includes(pending?.type) ? 0 : pending?.type === "plan_approval" || Object.keys(workflow.training_runs || {}).length ? 2 : 1) + "<section class='card body-pad'><div class='section-head' style='padding:0 0 15px'><div><h2>" + escapeHtml(workflow.dataset?.displayName || workflow.state?.dataset?.displayName || "Dataset workflow") + "</h2><p>Task: " + escapeHtml(datasetTasks[workflow.profile?.classification?.task || workflow.state?.profile?.classification?.task] || "Dataset analysis") + " · Candidates: " + (workflow.approved_plan?.candidateCount || workflow.state?.max_candidates || 3) + "</p></div><span class='pill " + (workflow.status === "complete" ? "complete" : "") + "'>" + escapeHtml(workflow.status) + "</span></div><p style='color:var(--muted);font-size:11px;margin-top:12px'>" + (workflow.error ? escapeHtml(workflow.error) : workflow.status === "waiting" ? "No GPU work will start until this checkpoint is resolved." : isDone ? "All available workflow results have been persisted locally." : "The trainer will update this page automatically.") + "</p></section>" + action + comparison + (workflow.status === "complete" ? "<details class='card body-pad' style='margin-top:16px'><summary>Training and prompt/RAG checks</summary>" + workflowTools(workflow) + "</details>" : workflowTools(workflow)) + "</div>";
   if (submittedStep) document.querySelector("#submitted-step-slot").replaceWith(submittedStep.node);
   bindWorkflowTools(workflow);
@@ -504,6 +505,17 @@ function renderWorkflow(workflow) {
       pollWorkflow(workflow.id);
       toast("Automatic evaluation started", "The local judge is grading saved base and tuned answers.");
     } catch (error) { toast("Evaluation unavailable", error.message); renderWorkflow(workflow); }
+  });
+  document.querySelector("#continue-workflow")?.addEventListener("click", async event => {
+    event.currentTarget.disabled = true;
+    try {
+      const response = await fetch("/api/workflow/runs/" + workflow.id + "/continue", {method:"POST"});
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || "The trainer may be busy or offline.");
+      renderWorkflow({...workflow, status:"queued", error:null, resumable:false, progress:null});
+      pollWorkflow(workflow.id);
+      toast("Workflow resumed", "Continuing from the last saved checkpoint.");
+    } catch (error) { toast("Could not resume workflow", error.message); renderWorkflow(workflow); }
   });
   document.querySelector("#back-config").onclick = () => location.hash = "#/workspace";
   document.querySelector("#update-dataset").onclick = () => updateDataset(workflow);
@@ -543,7 +555,7 @@ async function workflowPage(id) {
     if (!response.ok) throw new Error();
     const workflow = await response.json();
     renderWorkflow(workflow);
-    if (!["waiting", "complete", "blocked", "cancelled", "failed"].includes(workflow.status)) pollWorkflow(id);
+    if (!["waiting", "complete", "blocked", "cancelled", "failed", "interrupted"].includes(workflow.status)) pollWorkflow(id);
   } catch {
     app.innerHTML = shell("LangGraph workflow", "Workflow unavailable.", "Start the WSL trainer and open this workflow again.") + "</div>";
   }
