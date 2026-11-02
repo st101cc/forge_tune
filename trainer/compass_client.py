@@ -4,10 +4,13 @@ import re
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 ENDPOINT = "https://compass.llm.shopee.io/compass-api/v1"
 NON_TEXT_MODELS = re.compile(r"chirp|nmt|byteplus|-vl-|tts|whisper|embed|image|video|dall-e|imagen|veo|sora|audio", re.IGNORECASE)
+AVAILABLE_FILE = "compass-available.json"
 
 
 class CompassError(Exception):
@@ -84,6 +87,31 @@ def check_failure(model: str) -> CompassError | None:
     except CompassError as error:
         return error
     return None
+
+
+# The catalog lists models this key cannot run, so the whole catalog is checked once and the models that answered are saved.
+# The saved list is reused until someone rechecks; a definite refusal found later takes that one model off it.
+def load_available(data_root: Path) -> dict[str, Any] | None:
+    try:
+        saved = json.loads((Path(data_root) / AVAILABLE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None  # Never checked on this trainer, or the file is unreadable.
+    return saved if isinstance(saved, dict) and isinstance(saved.get("models"), list) else None
+
+
+def _write_available(data_root: Path, saved: dict[str, Any]) -> dict[str, Any]:
+    (Path(data_root) / AVAILABLE_FILE).write_text(json.dumps(saved), encoding="utf-8")
+    return saved
+
+
+def save_available(data_root: Path, models: list[str]) -> dict[str, Any]:
+    return _write_available(data_root, {"models": sorted(models), "checkedAt": datetime.now(timezone.utc).isoformat()})
+
+
+def drop_available(data_root: Path, model: str) -> None:
+    saved = load_available(data_root)
+    if saved and model in saved["models"]:
+        _write_available(data_root, {**saved, "models": [m for m in saved["models"] if m != model]})
 
 
 def check_model(model: str) -> str | None:

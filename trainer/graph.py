@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from benchmark import INSTRUCTION, MAX_TOKENS, select_model, apply_review, compass_results
-from compass_client import CompassError, answer_cases, check_failure, configured, text_models
+from compass_client import CompassError, answer_cases, check_failure, configured, drop_available, load_available, text_models
 from evaluator import DEFAULT_MODEL, comparable_evidence, evaluate_results
 from model_picker import MAX_COMPASS, MAX_LOCAL, built_in_proposal, propose_models
 from model_history import backfill_if_empty, recently_unavailable, record_benchmark, record_check_failure, summary_for
@@ -781,17 +781,22 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
             try:
                 # Models that definitely failed to run in the last 7 days are hidden from the agent and the add list.
                 catalog = await asyncio.to_thread(text_models)
+                # Once the whole catalog has been checked, offer only the models that answered, so nothing needs checking per run.
+                saved = load_available(services.data_root)
+                if saved is not None:
+                    catalog = [model for model in catalog if model in saved["models"]]
                 recent = _advisory({}, recently_unavailable, services.data_root)
                 skipped = {model: recent[model] for model in catalog if model in recent}
                 compass = [model for model in catalog if model not in skipped]
                 if picking:
                     brief = {key: state.get(key) for key in ("task_description", "success_metric", "analysis_limit")}
                     proposal = await asyncio.to_thread(propose_models, brief, state.get("profile", {}), memory, ranked, compass, history=_advisory([], summary_for, services.data_root, task))
-                if proposal and proposal["source"] == "agent":
-                    # The catalog lists models this key cannot run, so check only the proposed ones.
+                unchecked = [m for m in proposal["models"] if m["provider"] == "compass" and not (saved and m["id"] in saved["models"])] if proposal and proposal["source"] == "agent" else []
+                if unchecked:
+                    # Without a saved check the catalog may list models this key cannot run, so check the proposed ones.
                     report_progress(state, "Checking that the proposed Compass models respond")
                     left_out = 0
-                    for model in [m for m in proposal["models"] if m["provider"] == "compass"]:
+                    for model in unchecked:
                         failure = await asyncio.to_thread(check_failure, model["id"])
                         if failure:
                             left_out += 1
@@ -865,6 +870,8 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                         check=await asyncio.to_thread(check_failure,model)
                         if check:
                             row.update(unavailableDefinite=check.definite,checkMessage=str(check)[:300])
+                            if check.definite:
+                                _advisory(None,drop_available,services.data_root,model)
                     results.append(row)
             # Failed models have nothing to grade, so grading spans only the answers that came back.
             grading=total*len(ids)
