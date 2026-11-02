@@ -368,7 +368,7 @@ function modelPlanReview(pending) {
   return `<form id="model-plan" class="card body-pad experiment-form" data-compass="${escapeHtml(JSON.stringify(pending.compassOptions || []))}"><h2>Approve models to benchmark</h2><p>${escapeHtml(pending.message || "Approve or change the models to benchmark.")}</p>` +
     (proposal.note ? `<div class="notice">${escapeHtml(proposal.note)}</div>` : "") +
     (proposal.recommendation ? `<p>${escapeHtml(proposal.recommendation)}</p>` : "") +
-    `<div id="model-plan-rows">${rows}</div><div id="compass-add-section"><label>Add a Compass model<select id="compass-add" disabled><option value="">Checking which Compass models respond…</option></select></label><p id="compass-add-status" role="status"></p><div><button class="button" type="button" id="add-compass" disabled>Add</button></div></div>` +
+    `<div id="model-plan-rows">${rows}</div><div id="compass-add-section"><label>Add a Compass model<select id="compass-add" disabled><option value="">Checking which Compass models respond…</option></select></label><p id="compass-add-status" role="status"></p><div><button class="button" type="button" id="add-compass" disabled>Add</button> <button class="button" type="button" id="recheck-compass">Recheck all</button></div></div>` +
     (excluded ? `<h3>Not suggested</h3><ul class="resolution-list">${excluded}</ul>` : "") +
     (pending.privacyFlagged ? `<div class="notice" id="model-plan-privacy">This dataset was flagged for possible private data. Approving a list with Compass models confirms you are happy to send those questions to Compass.</div>` : "") +
     `<p id="model-plan-limit" role="status"></p><button class="button primary" type="button" id="approve-models">Approve and run</button> <button class="button" type="button" id="abort-workflow">Cancel</button></form>`;
@@ -406,7 +406,7 @@ function bindModelPlan(workflow) {
         status.textContent = result.total ? `Checking which Compass models respond: ${result.checked} of ${result.total}` : "Loading the Compass catalog…";
         return setTimeout(loadCompassModels, 2000);
       }
-      status.textContent = `Only models that answered a quick check are listed (checked ${new Date(result.checkedAt).toLocaleString()}).`;
+      status.textContent = `Only models that answered a quick check are listed (checked ${new Date(result.checkedAt).toLocaleString()}; models a run finds refused are removed). Rechecked models show from the next run.` + (result.error ? ` The last recheck failed: ${result.error}` : "");
       fillCompassOptions(result.models);
     } catch (error) {
       select.innerHTML = '<option value="">Compass models unavailable</option>';
@@ -414,11 +414,15 @@ function bindModelPlan(workflow) {
     }
   };
   loadCompassModels();
+  form.querySelector("#recheck-compass").onclick = async () => {
+    await fetch("/api/compass/available?refresh=true").catch(() => {});
+    loadCompassModels();
+  };
   select.addEventListener("change", () => form.querySelector("#add-compass").disabled = !select.value);
   form.querySelector("#add-compass").onclick = async () => {
     const input = select, add = form.querySelector("#add-compass"), id = input.value;
     if (!id) return;
-    // Recheck: the list can be a few hours old.
+    // Recheck: the saved list can be old, and a refusal here takes the model off it.
     add.disabled = true; add.textContent = "Checking…";
     try {
       const response = await fetch("/api/compass/check?model=" + encodeURIComponent(id));

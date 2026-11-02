@@ -417,18 +417,14 @@ async def compass_check(model: str = "") -> dict:
         raise HTTPException(503, "Compass is not configured. Set ADVISOR_API_KEY and the Compass ADVISOR_BASE_URL in the trainer's .env, then restart the trainer.")
     if not model.strip() or len(model) > 200:
         raise HTTPException(422, "Choose a Compass model ID of at most 200 characters.")
-    message = await asyncio.to_thread(compass_client.check_model, model)
-    return {"ok": message is None, "message": message or ""}
+    error = await asyncio.to_thread(compass_client.check_failure, model)
+    if error and error.definite:
+        compass_client.drop_available(DATA_ROOT, model)
+    return {"ok": error is None, "message": str(error) if error else ""}
 
 
-# The catalog lists models this key cannot run, so the add list shows only models that answered a quick check.
-COMPASS_AVAILABLE = DATA_ROOT / "compass-available.json"
-COMPASS_AVAILABLE_HOURS = 6
+# The add list and each run's Compass options come from the saved check; see compass_client.load_available.
 compass_availability: dict = {"status": "idle", "models": [], "checked": 0, "total": 0, "checkedAt": None}
-try:
-    compass_availability.update(json.loads(COMPASS_AVAILABLE.read_text(encoding="utf-8")), status="complete")
-except (OSError, ValueError):
-    pass  # Never checked on this trainer, or the cache is unreadable; the next request rebuilds it.
 
 
 def check_compass_catalog() -> None:
@@ -443,9 +439,10 @@ def check_compass_catalog() -> None:
                 if future.result() is None:
                     answered.append(futures[future])
                 compass_availability["checked"] += 1
-        result = {"models": sorted(answered), "checkedAt": datetime.now(timezone.utc).isoformat()}
-        COMPASS_AVAILABLE.write_text(json.dumps(result), encoding="utf-8")
-        compass_availability.update(result, status="complete")
+        if catalog and not answered:
+            # Most likely a Compass outage; saving an empty list would hide every model until the next recheck.
+            raise compass_client.CompassError("No Compass model answered the check, so the saved list was kept.")
+        compass_availability.update(compass_client.save_available(DATA_ROOT, answered), status="complete")
     except Exception as error:
         compass_availability.update(status="failed", error=compass_client.safe_message(error))
 
@@ -454,11 +451,14 @@ def check_compass_catalog() -> None:
 async def compass_available(refresh: bool = False) -> dict:
     if not compass_client.configured():
         raise HTTPException(503, "Compass is not configured on the trainer.")
-    checked_at = compass_availability.get("checkedAt")
-    stale = not checked_at or (datetime.now(timezone.utc) - datetime.fromisoformat(checked_at)).total_seconds() > COMPASS_AVAILABLE_HOURS * 3600
-    if compass_availability["status"] != "checking" and (refresh or stale or compass_availability["status"] == "failed"):
-        compass_availability.update(status="checking", checked=0, total=0)
-        asyncio.get_running_loop().run_in_executor(None, check_compass_catalog)
+    if compass_availability["status"] != "checking":
+        # Reread the file each time: a run that finds a model refused takes it off the saved list.
+        saved = compass_client.load_available(DATA_ROOT)
+        if saved and not refresh:
+            compass_availability.update(saved, status="complete")  # Any error from a failed recheck stays to be shown.
+        else:
+            compass_availability.update(status="checking", checked=0, total=0)
+            asyncio.get_running_loop().run_in_executor(None, check_compass_catalog)
     return compass_availability
 
 
