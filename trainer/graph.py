@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TypedDict
 
-from benchmark import INSTRUCTION, MAX_TOKENS, select_model, apply_review, compass_results
+from benchmark import INSTRUCTION, fits_local_window, output_budget, select_model, apply_review, compass_results
 from compass_client import CompassError, answer_cases, check_failure, configured, drop_available, load_available, text_models
 from evaluator import DEFAULT_MODEL, comparable_evidence, evaluate_results
 from model_picker import MAX_COMPASS, MAX_LOCAL, built_in_proposal, propose_models
@@ -847,10 +847,13 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         ref=state["dataset"]
         dataset=load_source(ref["source"],ref["name"],ref.get("extension"))
         manifest=json.loads(Path(state["split_manifest_path"]).read_text(encoding="utf-8"))
-        ids=manifest.get("developmentIndices",[])[:state.get("analysis_limit",50)]
+        development=manifest.get("developmentIndices",[])
+        fitting=[i for i in development if fits_local_window(dataset[i])]
+        ids=fitting[:state.get("analysis_limit",50)]
         results=[]
         if not ids:
-            return {"status":"blocked","errors":["No development questions are available for model selection."]}
+            return {"status":"blocked","errors":["No development questions are available for model selection." if not development else "Every development question is too long for the local models' 4096-token window."]}
+        max_tokens=output_budget([evaluation_messages(dataset[i],INSTRUCTION)[1] for i in ids])
         hosted=state.get("compass_models",[])
         total=len(state["candidates"])+len(hosted)
         # Each model answers then gets graded on every question: half the bar answering, half grading.
@@ -860,7 +863,7 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                 for index,candidate in enumerate(state["candidates"],1):
                     progress=counted_progress(state,f"Answering with {candidate['model']['id']} · model {index} of {total} · {len(ids)} questions",(index-1)*len(ids),units)
                     try:
-                        records=await run_inference(baseline_compare,dataset,[candidate],len(ids),eval_indices=ids,task=state["profile"]["classification"]["task"],instruction=INSTRUCTION,max_new_tokens=MAX_TOKENS,strict_context=True,on_progress=progress)
+                        records=await run_inference(baseline_compare,dataset,[candidate],len(ids),eval_indices=ids,task=state["profile"]["classification"]["task"],instruction=INSTRUCTION,max_new_tokens=max_tokens,strict_context=True,on_progress=progress)
                         record=records[0]
                     except Exception as error:
                         record={"status":"unavailable","message":str(error)[:300]}
@@ -871,9 +874,9 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                 try:
                     rows=[dataset[i] for i in ids]
                     cases=[{"rowId":i,"messages":[m for m in evaluation_messages(row,INSTRUCTION)[0] if not (m["role"]=="system" and not m["content"].strip())]} for i,row in zip(ids,rows)]
-                    answers=await asyncio.to_thread(answer_cases,model,cases,on_answer=progress,max_tokens=MAX_TOKENS)
-                    job={"phase":"development","status":"complete","instruction":INSTRUCTION,"maxOutputTokens":MAX_TOKENS,"splitManifestId":state["split_manifest_id"],"models":[model],"cases":cases,"results":answers}
-                    results+=compass_results(job,{"developmentIds":ids,"splitManifestId":state["split_manifest_id"]},rows)
+                    answers=await asyncio.to_thread(answer_cases,model,cases,on_answer=progress,max_tokens=max_tokens)
+                    job={"phase":"development","status":"complete","instruction":INSTRUCTION,"maxOutputTokens":max_tokens,"splitManifestId":state["split_manifest_id"],"models":[model],"cases":cases,"results":answers}
+                    results+=compass_results(job,{"developmentIds":ids,"splitManifestId":state["split_manifest_id"],"maxOutputTokens":max_tokens},rows)
                 except Exception as error:  # One failing hosted model must not discard the local answers, as for local models above.
                     row={"status":"unavailable","message":str(error)[:300],"modelId":model,"provider":"compass","unavailableDefinite":False}
                     # The request carried dataset text, so a 4xx may be about this dataset; only a refused dataset-free check bans the model.
@@ -895,7 +898,7 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         summary=select_model(results,ids)
         summary["accuracyReview"] = accuracy_agent_review(results)
         _advisory(None,record_benchmark,services.data_root,state["profile"]["classification"]["task"],results,state["workflow_id"])
-        return {"model_benchmark":{**summary,"splitManifestId":state["split_manifest_id"],"instruction":INSTRUCTION,"maxOutputTokens":MAX_TOKENS,"prices":prices},"status":"awaiting_model_selection"}
+        return {"model_benchmark":{**summary,"splitManifestId":state["split_manifest_id"],"instruction":INSTRUCTION,"maxOutputTokens":max_tokens,"tooLongQuestions":len(development)-len(fitting),"prices":prices},"status":"awaiting_model_selection"}
 
     async def model_selection(state: WorkflowState) -> dict[str, Any]:
         benchmark=state["model_benchmark"]
