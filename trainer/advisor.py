@@ -424,8 +424,9 @@ def baseline_compare(
         try:
             tokenizer = AutoTokenizer.from_pretrained(candidate["model"]["id"], use_fast=True)
             tokenizer.pad_token = tokenizer.eos_token
-            quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4") if candidate["method"] == "qlora" else None
-            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map="auto")
+            # Load as training does (train.py): T4s compute far faster in float16 than in the float32 default.
+            quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if candidate["method"] == "qlora" else None
+            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map="auto", torch_dtype=torch.float16)
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
             references, predictions = [], []
@@ -489,10 +490,11 @@ def evaluate_tuned_run(
     method = candidate.get("method", "qlora")
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
-    quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4") if method == "qlora" else None
+    # Same precision as the baseline comparison, so base and tuned answers are compared fairly.
+    quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
     base = model = inputs = loss_output = output = None
     try:
-        base = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map="auto")
+        base = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map="auto", torch_dtype=torch.float16)
         model = PeftModel.from_pretrained(base, str(run_dir / "adapter"))
         rows_dataset = test_dataset if test_dataset is not None else dataset
         rows = rows_dataset.select(list(eval_indices))
