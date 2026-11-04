@@ -352,6 +352,48 @@ def cloud_assess_blockers(samples: list[dict[str, Any]], profile: dict[str, Any]
         return None
 
 
+TASK_TEMPLATES = {
+    "classification": ("Classify each text into one of the labels in the {label} column.", "Label accuracy on unseen examples; review the errors for each label."),
+    "code": ("Write code that does what each request asks.", "The code meets the request and handles edge cases, judged against the reference solution."),
+    "structured": ("Produce output in the same structured format as the reference answers.", "The output exactly matches the reference structure and values."),
+    "writing": ("Write text in the tone, structure and format of the reference answers.", "The text meets the requested tone, structure and constraints, judged against the reference."),
+    "assistant": ("Answer each user message the way the reference replies do.", "Answers are correct, complete and follow the request, judged against the reference reply."),
+}
+
+
+def draft_task_brief(profile: dict[str, Any], cloud: bool = False) -> dict[str, str]:
+    """A starting point for the task form; the user edits or replaces it before anything runs."""
+    samples = profile.get("_samples", [])
+    classification = profile.get("classification", {})
+    if any("\\boxed{" in str(sample.get("text", "")) for sample in samples):
+        # Matches how the benchmark grades these datasets: on the final \boxed{} answer.
+        description, metric = ("Solve each math problem step by step and give the final answer in \\boxed{}.",
+                               "The final \\boxed{} answer matches the reference answer; a missing or cut-off final answer counts as wrong.")
+    else:
+        description, metric = TASK_TEMPLATES.get(classification.get("task"), TASK_TEMPLATES["assistant"])
+        description = description.format(label=profile.get("facts", {}).get("labelField") or "label")
+    draft = {"task_description": description, "success_metric": metric, "source": "local"}
+    if not cloud or not cloud_status()["configured"]:
+        return draft
+    endpoint = os.environ["ADVISOR_BASE_URL"].rstrip("/") + "/chat/completions"
+    prompt = {
+        "classification": classification, "facts": profile.get("facts", {}), "draft": draft,
+        "redactedRows": [{**sample, "text": str(sample.get("text", ""))[:600]} for sample in samples[:5]],
+        "instruction": "Improve the draft for this dataset. Return JSON only: {task_description:string, success_metric:string}, one or two sentences each. "
+                       "Describe what a model trained on these rows should do and how to tell a correct answer from a wrong one. Do not quote personal data.",
+    }
+    request = urllib.request.Request(endpoint, data=json.dumps({"model": os.environ["ADVISOR_MODEL"], "messages": [{"role": "user", "content": json.dumps(prompt)}], "temperature": 0}).encode(), headers={"Authorization": "Bearer " + os.environ["ADVISOR_API_KEY"], "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            content = json.loads(response.read())["choices"][0]["message"]["content"]
+        result = json.loads(content.strip().removeprefix("```json").removesuffix("```").strip())
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
+        return draft
+    if not isinstance(result, dict) or not all(isinstance(result.get(key), str) and 1 <= len(result[key].strip()) <= 2000 for key in ("task_description", "success_metric")):
+        return draft
+    return {"task_description": result["task_description"].strip(), "success_metric": result["success_metric"].strip(), "source": "cloud"}
+
+
 def connection_test() -> dict[str, Any]:
     if not cloud_status()["configured"]:
         return {"ok": False, "message": "Cloud assist is not configured."}
