@@ -397,6 +397,36 @@ def retrieval_evaluation_prompt(row, tokenizer, instruction, documents, max_leng
     return prompt, reference, []
 
 
+# ponytail: fixed batch size, halved on out-of-memory; size it from free GPU memory if 8 proves too small or too large.
+ANSWER_BATCH = 8
+
+
+def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], max_new_tokens: int, torch: Any) -> list[tuple[str, bool]]:
+    """Greedy answers for several prompts in one generate call: decoding is memory-bound, so a batch costs about one answer's time."""
+    output = None
+    try:
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(model.device)
+        with torch.no_grad():
+            output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    except torch.cuda.OutOfMemoryError:
+        if len(prompts) == 1:
+            raise
+    if output is None:
+        # Split outside the except block so the failed attempt's tensors can be freed first.
+        inputs = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        half = len(prompts) // 2
+        return _generate_batch(model, tokenizer, prompts[:half], max_new_tokens, torch) + _generate_batch(model, tokenizer, prompts[half:], max_new_tokens, torch)
+    prompt_length = inputs["input_ids"].shape[1]
+    answers = []
+    for row in output:
+        new = row[prompt_length:]
+        # Answers that stop early are padded to the batch's length; one cut off ends on a real token.
+        answers.append((tokenizer.decode(new, skip_special_tokens=True), len(new) >= max_new_tokens and int(new[-1]) != tokenizer.eos_token_id))
+    return answers
+
+
 def baseline_compare(
     dataset: Dataset,
     candidates: list[dict[str, Any]],
@@ -424,40 +454,50 @@ def baseline_compare(
         try:
             tokenizer = AutoTokenizer.from_pretrained(candidate["model"]["id"], use_fast=True)
             tokenizer.pad_token = tokenizer.eos_token
+            # Batched generation must continue each prompt from its own last token.
+            tokenizer.padding_side = "left"
             # Load as training does (train.py): T4s compute far faster in float16 than in the float32 default.
             quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if candidate["method"] == "qlora" else None
             model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map="auto", torch_dtype=torch.float16)
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
             references, predictions = [], []
+            prepared = []
             for index, row in enumerate(rows):
                 prompt, reference, retrieved = retrieval_evaluation_prompt(row, tokenizer, instruction, knowledge_documents)
-                if strict_context and len(tokenizer.encode(prompt)) > 4096:
+                length = len(tokenizer.encode(prompt))
+                if strict_context and length > 4096:
                     raise ValueError("Benchmark input exceeds the 4096-token evaluation window; no truncated comparison is allowed.")
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
-                with torch.no_grad():
-                    loss_output = model(**inputs, labels=inputs["input_ids"])
-                    if loss_output.loss is not None and math.isfinite(float(loss_output.loss.item())):
-                        losses.append(float(loss_output.loss.item()))
+                prepared.append((index, prompt, reference, retrieved, length))
+            for start in range(0, len(prepared), ANSWER_BATCH):
+                chunk = prepared[start:start + ANSWER_BATCH]
+                for _, prompt, *_ in chunk:
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
+                    with torch.no_grad():
+                        loss_output = model(**inputs, labels=inputs["input_ids"])
+                        if loss_output.loss is not None and math.isfinite(float(loss_output.loss.item())):
+                            losses.append(float(loss_output.loss.item()))
+                inputs = loss_output = None
                 answer_started = time.perf_counter()
-                output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
-                answer_seconds.append(time.perf_counter() - answer_started)
-                generated = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                references.append(reference)
-                predictions.append(generated)
-                if reference:
-                    expected = set(re.findall(r"\w+", reference.lower()))
-                    actual = set(re.findall(r"\w+", generated.lower()))
-                    scores.append(len(expected & actual) / max(1, len(expected | actual)))
-                if task == "structured":
-                    try:
-                        json.loads(generated)
-                        format_scores.append(1.0)
-                    except (TypeError, json.JSONDecodeError):
-                        format_scores.append(0.0)
-                samples.append({"retrieved": retrieved, "rowId": selected_indices[index], "input": prompt, "reference": reference, "baseOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": len(tokenizer.encode(prompt)) > 4096, "hitTokenLimit": len(output[0]) - inputs["input_ids"].shape[1] >= max_new_tokens})
+                answers = _generate_batch(model, tokenizer, [item[1] for item in chunk], max_new_tokens, torch)
+                seconds = (time.perf_counter() - answer_started) / len(chunk)
+                for (index, prompt, reference, retrieved, length), (generated, hit_limit) in zip(chunk, answers):
+                    answer_seconds.append(seconds)
+                    references.append(reference)
+                    predictions.append(generated)
+                    if reference:
+                        expected = set(re.findall(r"\w+", reference.lower()))
+                        actual = set(re.findall(r"\w+", generated.lower()))
+                        scores.append(len(expected & actual) / max(1, len(expected | actual)))
+                    if task == "structured":
+                        try:
+                            json.loads(generated)
+                            format_scores.append(1.0)
+                        except (TypeError, json.JSONDecodeError):
+                            format_scores.append(0.0)
+                    samples.append({"retrieved": retrieved, "rowId": selected_indices[index], "input": prompt, "reference": reference, "baseOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": length > 4096, "hitTokenLimit": hit_limit})
                 if on_progress:
-                    on_progress(number * len(rows) + index + 1, len(candidates) * len(rows))
+                    on_progress(number * len(rows) + start + len(chunk), len(candidates) * len(rows))
             eval_loss = round(sum(losses) / len(losses), 4) if losses else None
             results.append({**task_quality(list(rows), references, predictions, selected_indices), "modelId": candidate["model"]["id"], "status": "complete", "examples": len(rows), "evaluationIds": selected_indices, "eval_loss": eval_loss, "perplexity": round(math.exp(eval_loss), 3) if eval_loss is not None and eval_loss < 700 else None, "meanTokenOverlap": round(sum(scores) / len(scores), 3) if scores else None, "formatValidRate": round(sum(format_scores) / len(format_scores), 3) if format_scores else None, "inferenceSeconds": sum(answer_seconds), "meanLatencySeconds": sum(answer_seconds) / len(answer_seconds) if answer_seconds else None, "maxOutputTokens": max_new_tokens, "latencySeconds": round(time.perf_counter() - started, 1), "samples": samples})
         except Exception as error:
