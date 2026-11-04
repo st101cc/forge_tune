@@ -1,10 +1,26 @@
 """Development-only model selection; no model-size or word-overlap quality proxy."""
 import math
 from advisor import evaluation_messages, task_quality
-from evaluator import comparable_evidence
+from evaluator import comparable_evidence, final_answer
 
 INSTRUCTION = "Answer accurately and concisely. Follow the requested language and output format exactly. Ask a brief clarification if essential information is ambiguous."
 MAX_TOKENS = 256
+# Worked solutions run long: 256 tokens cuts them off before the final answer they are graded on.
+FINAL_ANSWER_MAX_TOKENS = 1024
+# ponytail: about 2.5 characters per token keeps a question inside the local models' 4096-token window; count tokens per model if this drops too many.
+QUESTION_CHARS = 9000
+
+
+def output_budget(references):
+    """More output room when most references are graded on a final \\boxed{} answer."""
+    boxed = sum(final_answer(reference) is not None for reference in references)
+    return FINAL_ANSWER_MAX_TOKENS if references and boxed * 2 >= len(references) else MAX_TOKENS
+
+
+def fits_local_window(row):
+    # The local benchmark refuses a model outright when any question overflows its window, so overlong questions are left out for every model.
+    messages, _ = evaluation_messages(row, INSTRUCTION)
+    return sum(len(str(message.get("content", ""))) for message in messages) <= QUESTION_CHARS
 
 
 def number(value):
@@ -75,8 +91,9 @@ def apply_review(results, response, prices):
 
 def compass_results(job, benchmark, rows):
     ids=benchmark["developmentIds"]
-    if not isinstance(job,dict) or job.get("phase")!="development" or job.get("status")!="complete" or job.get("splitManifestId")!=benchmark["splitManifestId"] or job.get("instruction")!=INSTRUCTION or job.get("maxOutputTokens")!=MAX_TOKENS:
-        raise ValueError("Use a completed Compass development benchmark with this split, prompt and 256-token budget.")
+    budget=benchmark.get("maxOutputTokens",MAX_TOKENS)
+    if not isinstance(job,dict) or job.get("phase")!="development" or job.get("status")!="complete" or job.get("splitManifestId")!=benchmark["splitManifestId"] or job.get("instruction")!=INSTRUCTION or job.get("maxOutputTokens")!=budget:
+        raise ValueError(f"Use a completed Compass development benchmark with this split, prompt and {budget}-token budget.")
     cases=job.get("cases",[])
     expected=[];references=[]
     for row,i in zip(rows,ids):
