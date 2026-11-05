@@ -193,7 +193,7 @@ def evaluate_results(dataset, results, task="assistant", model_id=None, instruct
                     answer = final_answer(output)
                     grade.update(task="final_answer", method="final_answer")
                     if answer is None:
-                        grade.update(verdict="fail", reason="No final \\boxed{} answer" + (": the answer was cut off at the output limit." if sample.get("hitTokenLimit") else "."))
+                        grade.update(verdict="fail", reason="No final \\boxed{} answer" + (": the answer was cut off at the output limit." if sample.get("hitTokenLimit") else ": the model kept repeating itself and was stopped." if sample.get("stoppedRepeating") else "."))
                     elif answers_match(expected, answer):
                         grade.update(verdict="pass", reason="The final answer matches the reference.")
                     else:

@@ -397,17 +397,50 @@ def retrieval_evaluation_prompt(row, tokenizer, instruction, documents, max_leng
     return prompt, reference, []
 
 
-# ponytail: fixed batch size, halved on out-of-memory; size it from free GPU memory if 8 proves too small or too large.
-ANSWER_BATCH = 8
+# Repetition shorter than this is normal (matrix rows, "& 0 & 0"); a loop repeats one block back to back for longer.
+LOOP_TOKENS = 200
 
 
-def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], max_new_tokens: int, torch: Any) -> list[tuple[str, bool]]:
-    """Greedy answers for several prompts in one generate call: decoding is memory-bound, so a batch costs about one answer's time."""
+def _repeating(tokens: list[int]) -> bool:
+    """True when the tokens end in one block repeated back to back over at least LOOP_TOKENS tokens (at least 3 copies)."""
+    for period in range(1, LOOP_TOKENS + 1):
+        copies = max(3, -(-LOOP_TOKENS // period))
+        if len(tokens) < period * copies:
+            continue
+        block = tokens[-period:]
+        if all(tokens[len(tokens) - (k + 1) * period:len(tokens) - k * period] == block for k in range(1, copies)):
+            return True
+    return False
+
+
+def _stop_repeating(prompt_length: int, torch: Any) -> Any:
+    """Greedy decoding can repeat a block forever without ending; stop only those answers, checking every 32 tokens."""
+    from transformers import StoppingCriteria
+
+    class StopRepeating(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            done = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            if (input_ids.shape[1] - prompt_length) % 32 == 0:
+                tails = input_ids[:, max(prompt_length, input_ids.shape[1] - 3 * LOOP_TOKENS):].tolist()
+                for row, tokens in enumerate(tails):
+                    done[row] = _repeating(tokens)
+            return done
+
+    return StopRepeating()
+
+
+def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], torch: Any, max_new_tokens: int | None = None) -> list[dict[str, Any]]:
+    """Greedy answers for several prompts in one generate call: decoding is memory-bound, so a batch costs about one answer's time.
+
+    Without max_new_tokens an answer runs until the model ends it, its context is full, or it loops."""
     output = None
     try:
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(model.device)
+        prompt_length = inputs["input_ids"].shape[1]
+        context = getattr(getattr(model, "config", None), "max_position_embeddings", None) or 32768
         with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+            output = model.generate(**inputs, max_new_tokens=max_new_tokens or context - prompt_length, do_sample=False, pad_token_id=tokenizer.eos_token_id,
+                                    stopping_criteria=[_stop_repeating(prompt_length, torch)])
     except torch.cuda.OutOfMemoryError:
         if len(prompts) == 1:
             raise
@@ -417,14 +450,67 @@ def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], max_new_toke
         gc.collect()
         torch.cuda.empty_cache()
         half = len(prompts) // 2
-        return _generate_batch(model, tokenizer, prompts[:half], max_new_tokens, torch) + _generate_batch(model, tokenizer, prompts[half:], max_new_tokens, torch)
-    prompt_length = inputs["input_ids"].shape[1]
+        return _generate_batch(model, tokenizer, prompts[:half], torch, max_new_tokens) + _generate_batch(model, tokenizer, prompts[half:], torch, max_new_tokens)
+    ends = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    ends = {tokenizer.eos_token_id, *(ends if isinstance(ends, list) else [ends] if ends is not None else [])}
     answers = []
     for row in output:
-        new = row[prompt_length:]
-        # Answers that stop early are padded to the batch's length; one cut off ends on a real token.
-        answers.append((tokenizer.decode(new, skip_special_tokens=True), len(new) >= max_new_tokens and int(new[-1]) != tokenizer.eos_token_id))
+        new = [int(token) for token in row[prompt_length:]]
+        ended = next((i for i, token in enumerate(new) if token in ends), None)
+        if ended is not None:
+            new = new[:ended]  # Answers that end early are padded to the batch's length.
+        looping = ended is None and _repeating(new)
+        answers.append({"text": tokenizer.decode(new, skip_special_tokens=True), "hitTokenLimit": ended is None and not looping, "stoppedRepeating": looping})
     return answers
+
+
+# Measured on the VM's two T4s with 4-bit Qwen2.5-7B and Mistral-7B: 8, 16 and 32 answers at once gave about
+# 65, 100 and 135 tokens/s; 48 ran out of memory even with 330-token prompts.
+MAX_ANSWER_BATCH = 32
+BATCH_INPUT_TOKENS = 10_000  # 32 prompts of ~330 tokens fitted, 48 did not.
+# Answers have no length cap; this is only the growth each answer's KV cache is planned for when sizing a batch.
+ANSWER_ROOM = 4096
+
+
+def _plan_batches(lengths: list[int], kv_bytes: float, free_bytes: float) -> list[list[int]]:
+    """Group prompts of similar length into batches that fit the GPU; returns prompt positions per batch."""
+    batches: list[list[int]] = []
+    for position in sorted(range(len(lengths)), key=lengths.__getitem__):
+        size, longest = len(batches[-1]) + 1 if batches else 1, lengths[position]  # Sorted, so the newest is the longest.
+        fits = batches and size <= MAX_ANSWER_BATCH and size * longest <= BATCH_INPUT_TOKENS and size * (longest + ANSWER_ROOM) * kv_bytes <= 0.8 * free_bytes
+        if fits:
+            batches[-1].append(position)
+        else:
+            batches.append([position])
+    return batches
+
+
+def _free_gpu_bytes(torch: Any) -> float:
+    try:
+        return float(sum(torch.cuda.mem_get_info(device)[0] for device in range(torch.cuda.device_count())))
+    except (AttributeError, RuntimeError):
+        return float("inf")  # No CUDA to measure; only the batch and input limits apply.
+
+
+def _answer_all(model: Any, tokenizer: Any, prompts: list[str], lengths: list[int], torch: Any, max_new_tokens: int | None = None,
+                on_batch: Callable[[int], None] | None = None) -> tuple[list[dict[str, Any]], list[float]]:
+    """Answers every prompt in GPU-sized batches; returns the answers and each one's share of its batch's time, in prompt order."""
+    config = getattr(model, "config", None)
+    heads = getattr(config, "num_attention_heads", None)
+    head_dim = getattr(config, "head_dim", None) or (getattr(config, "hidden_size", 0) // heads if heads else 0)
+    kv_bytes = 2 * getattr(config, "num_hidden_layers", 0) * getattr(config, "num_key_value_heads", heads or 0) * head_dim * 2
+    answers: list[Any] = [None] * len(prompts)
+    seconds = [0.0] * len(prompts)
+    done = 0
+    for batch in _plan_batches([min(length, 4096) for length in lengths], kv_bytes, _free_gpu_bytes(torch)):
+        started = time.perf_counter()
+        for position, answer in zip(batch, _generate_batch(model, tokenizer, [prompts[i] for i in batch], torch, max_new_tokens)):
+            answers[position] = answer
+            seconds[position] = (time.perf_counter() - started) / len(batch)
+        done += len(batch)
+        if on_batch:
+            on_batch(done)
+    return answers, seconds
 
 
 def baseline_compare(
@@ -435,7 +521,7 @@ def baseline_compare(
     task: str | None = None,
     instruction: str = "",
     knowledge_documents: list[dict[str, Any]] | None = None,
-    max_new_tokens: int = 512,
+    max_new_tokens: int | None = None,
     strict_context: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
@@ -469,35 +555,30 @@ def baseline_compare(
                 if strict_context and length > 4096:
                     raise ValueError("Benchmark input exceeds the 4096-token evaluation window; no truncated comparison is allowed.")
                 prepared.append((index, prompt, reference, retrieved, length))
-            for start in range(0, len(prepared), ANSWER_BATCH):
-                chunk = prepared[start:start + ANSWER_BATCH]
-                for _, prompt, *_ in chunk:
-                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
-                    with torch.no_grad():
-                        loss_output = model(**inputs, labels=inputs["input_ids"])
-                        if loss_output.loss is not None and math.isfinite(float(loss_output.loss.item())):
-                            losses.append(float(loss_output.loss.item()))
-                inputs = loss_output = None
-                answer_started = time.perf_counter()
-                answers = _generate_batch(model, tokenizer, [item[1] for item in chunk], max_new_tokens, torch)
-                seconds = (time.perf_counter() - answer_started) / len(chunk)
-                for (index, prompt, reference, retrieved, length), (generated, hit_limit) in zip(chunk, answers):
-                    answer_seconds.append(seconds)
-                    references.append(reference)
-                    predictions.append(generated)
-                    if reference:
-                        expected = set(re.findall(r"\w+", reference.lower()))
-                        actual = set(re.findall(r"\w+", generated.lower()))
-                        scores.append(len(expected & actual) / max(1, len(expected | actual)))
-                    if task == "structured":
-                        try:
-                            json.loads(generated)
-                            format_scores.append(1.0)
-                        except (TypeError, json.JSONDecodeError):
-                            format_scores.append(0.0)
-                    samples.append({"retrieved": retrieved, "rowId": selected_indices[index], "input": prompt, "reference": reference, "baseOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": length > 4096, "hitTokenLimit": hit_limit})
-                if on_progress:
-                    on_progress(number * len(rows) + start + len(chunk), len(candidates) * len(rows))
+            for _, prompt, *_ in prepared:
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
+                with torch.no_grad():
+                    loss_output = model(**inputs, labels=inputs["input_ids"])
+                    if loss_output.loss is not None and math.isfinite(float(loss_output.loss.item())):
+                        losses.append(float(loss_output.loss.item()))
+            inputs = loss_output = None
+            report = (lambda done, number=number: on_progress(number * len(rows) + done, len(candidates) * len(rows))) if on_progress else None
+            answers, answer_seconds = _answer_all(model, tokenizer, [item[1] for item in prepared], [item[4] for item in prepared], torch, max_new_tokens, report)
+            for (index, prompt, reference, retrieved, length), answer in zip(prepared, answers):
+                generated = answer["text"]
+                references.append(reference)
+                predictions.append(generated)
+                if reference:
+                    expected = set(re.findall(r"\w+", reference.lower()))
+                    actual = set(re.findall(r"\w+", generated.lower()))
+                    scores.append(len(expected & actual) / max(1, len(expected | actual)))
+                if task == "structured":
+                    try:
+                        json.loads(generated)
+                        format_scores.append(1.0)
+                    except (TypeError, json.JSONDecodeError):
+                        format_scores.append(0.0)
+                samples.append({"retrieved": retrieved, "rowId": selected_indices[index], "input": prompt, "reference": reference, "baseOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": length > 4096, "hitTokenLimit": answer["hitTokenLimit"], "stoppedRepeating": answer["stoppedRepeating"]})
             eval_loss = round(sum(losses) / len(losses), 4) if losses else None
             results.append({**task_quality(list(rows), references, predictions, selected_indices), "modelId": candidate["model"]["id"], "status": "complete", "examples": len(rows), "evaluationIds": selected_indices, "eval_loss": eval_loss, "perplexity": round(math.exp(eval_loss), 3) if eval_loss is not None and eval_loss < 700 else None, "meanTokenOverlap": round(sum(scores) / len(scores), 3) if scores else None, "formatValidRate": round(sum(format_scores) / len(format_scores), 3) if format_scores else None, "inferenceSeconds": sum(answer_seconds), "meanLatencySeconds": sum(answer_seconds) / len(answer_seconds) if answer_seconds else None, "maxOutputTokens": max_new_tokens, "latencySeconds": round(time.perf_counter() - started, 1), "samples": samples})
         except Exception as error:
@@ -530,7 +611,8 @@ def evaluate_tuned_run(
     method = candidate.get("method", "qlora")
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
-    # Same precision as the baseline comparison, so base and tuned answers are compared fairly.
+    tokenizer.padding_side = "left"
+    # Same precision and batched, unlimited generation as the baseline comparison, so base and tuned answers are compared fairly.
     quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
     base = model = inputs = loss_output = output = None
     try:
@@ -544,15 +626,18 @@ def evaluate_tuned_run(
         samples: list[dict[str, Any]] = []
         references, predictions = [], []
         started = time.perf_counter()
-        for position, row in enumerate(rows):
-            prompt, reference, retrieved = retrieval_evaluation_prompt(row, tokenizer, instruction, knowledge_documents)
+        prepared = [retrieval_evaluation_prompt(row, tokenizer, instruction, knowledge_documents) for row in rows]
+        for prompt, _, _ in prepared:
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
             with torch.no_grad():
                 loss_output = model(**inputs, labels=inputs["input_ids"])
                 if loss_output.loss is not None and math.isfinite(float(loss_output.loss.item())):
                     losses.append(float(loss_output.loss.item()))
-            output = model.generate(**inputs, max_new_tokens=512, do_sample=False, pad_token_id=tokenizer.eos_token_id)
-            generated = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        inputs = loss_output = None
+        lengths = [len(tokenizer.encode(prompt)) for prompt, _, _ in prepared]
+        answers, _ = _answer_all(model, tokenizer, [prompt for prompt, _, _ in prepared], lengths, torch)
+        for position, ((prompt, reference, retrieved), answer) in enumerate(zip(prepared, answers)):
+            generated = answer["text"]
             references.append(reference)
             predictions.append(generated)
             if reference:
@@ -566,7 +651,7 @@ def evaluate_tuned_run(
                 except (TypeError, json.JSONDecodeError):
                     format_scores.append(0.0)
             if position < 100:
-                samples.append({"input": prompt, "retrieved": retrieved, "rowId": eval_indices[position], "tunedOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": len(tokenizer.encode(prompt)) > 4096, "hitTokenLimit": len(output[0]) - inputs["input_ids"].shape[1] >= 512})
+                samples.append({"input": prompt, "retrieved": retrieved, "rowId": eval_indices[position], "tunedOutput": generated, "referenceAvailable": bool(reference), "inputTruncated": lengths[position] > 4096, "hitTokenLimit": answer["hitTokenLimit"], "stoppedRepeating": answer["stoppedRepeating"]})
         eval_loss = round(sum(losses) / len(losses), 4) if losses else None
         result = {
             **task_quality(list(rows), references, predictions, list(eval_indices)),
