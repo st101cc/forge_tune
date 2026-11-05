@@ -9,7 +9,7 @@ import re
 from advisor import evaluation_messages, task_quality
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-VERSION = "task-rubrics-v2"
+VERSION = "task-rubrics-v3"
 RUBRICS = {
     "math": "Check the derivation, arithmetic, units, assumptions and final result. An unsupported or incorrect derivation fails even if the final result matches.",
     "code": "Check the requested language, APIs, algorithm and edge cases. Code must meet the specification. This is static review, not an execution test; abstain if execution is essential to judge it.",
@@ -122,8 +122,15 @@ class LocalJudge:
 
 
 def parse_grade(raw):
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-    data = json.loads(raw)
+    # The object may sit inside ``` fences, single backticks or a sentence.
+    start, end = raw.find("{"), raw.rfind("}")
+    raw = raw[start:end + 1] if 0 <= start < end else raw
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Judges quote math as LaTeX (\( \rceil) without escaping the backslash, which JSON rejects;
+        # in such output every lone backslash is LaTeX, so keep only \" and \\ as escapes.
+        data = json.loads(re.sub(r'\\(["\\])|\\', lambda m: m.group(0) if m.group(1) else "\\\\", raw))
     if not isinstance(data, dict) or data.get("verdict") not in {"pass", "fail", "abstain"} or not isinstance(data.get("reason"), str) or not data["reason"].strip():
         raise ValueError("Judge did not return a valid verdict and reason.")
     return {"verdict": data["verdict"], "reason": data["reason"].strip()[:600]}
