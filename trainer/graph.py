@@ -853,6 +853,7 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         results=[]
         if not ids:
             return {"status":"blocked","errors":["No development questions are available for model selection." if not development else "Every development question is too long for the local models' 4096-token window."]}
+        # Local answers have no length limit (free on the VM); hosted answers are billed per token, so they keep one.
         max_tokens=output_budget([evaluation_messages(dataset[i],INSTRUCTION)[1] for i in ids])
         hosted=state.get("compass_models",[])
         total=len(state["candidates"])+len(hosted)
@@ -863,7 +864,7 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                 for index,candidate in enumerate(state["candidates"],1):
                     progress=counted_progress(state,f"Answering with {candidate['model']['id']} · model {index} of {total} · {len(ids)} questions",(index-1)*len(ids),units)
                     try:
-                        records=await run_inference(baseline_compare,dataset,[candidate],len(ids),eval_indices=ids,task=state["profile"]["classification"]["task"],instruction=INSTRUCTION,max_new_tokens=max_tokens,strict_context=True,on_progress=progress)
+                        records=await run_inference(baseline_compare,dataset,[candidate],len(ids),eval_indices=ids,task=state["profile"]["classification"]["task"],instruction=INSTRUCTION,strict_context=True,on_progress=progress)
                         record=records[0]
                     except Exception as error:
                         record={"status":"unavailable","message":str(error)[:300]}

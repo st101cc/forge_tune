@@ -355,7 +355,7 @@ function workflowComparison(comparison) {
   const verdict = comparison.winner ? "A candidate improved — review before deployment" : comparison.decision === "keep_baseline" ? "Keep the base model" : "Improvement not established";
   return `<div class="notice"><strong>${escapeHtml(verdict)}</strong><p>${comparison.winner ? "Inspect the measured gains and any regressions below." : "Training completed, but these results do not justify deploying the fine-tune as an improvement."}</p></div><p>${comparison.evaluationIds?.length || 0} unseen questions · Same questions and prompt for both models</p>` + pairs.map(pair => {
     const base = pair.base || {}, tuned = pair.tuned || {};
-    const cutoffs = result => (result.samples || []).filter(sample => sample.hitTokenLimit).length;
+    const cutoffs = result => (result.samples || []).filter(sample => sample.hitTokenLimit || sample.stoppedRepeating).length;
     const a = base.qualityEvidence || {}, b = tuned.qualityEvidence || {};
     const measured = a.metric && base.evaluationIds?.length > 0 && a.coverage === 1 && b.coverage === 1 && a.metric === b.metric && a.evaluatorId === b.evaluatorId && a.rubric === b.rubric && a.evaluatedExamples === base.evaluationIds?.length && b.evaluatedExamples === tuned.evaluationIds?.length && JSON.stringify(base.evaluationIds) === JSON.stringify(tuned.evaluationIds) && Number.isFinite(a.score) && Number.isFinite(b.score);
     const estimated = a.estimated || b.estimated;
