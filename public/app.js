@@ -72,10 +72,18 @@ function shell(kicker, title, lead, actions = "") {
   return "<div class='page'><div class='topbar'><div><div class='kicker'>" + kicker + "</div><h1>" + title + "</h1><p class='lead'>" + lead + "</p></div>" + controls + "</div>";
 }
 
-function steps(active) {
+function steps(active, skipped = []) {
   return "<div class='steps'>" + ["Analyze dataset", "Test base & prompts", "Review & train", "Compare & decide"].map((name, index) =>
+    skipped.includes(index) ? "<div class='step skipped'><b>–</b>" + name + " (skipped)</div>" :
     "<div class='step " + (index === active ? "active" : index < active ? "done" : "") + "'><b>" + (index < active ? "✓" : index + 1) + "</b>" + name + "</div>"
   ).join("") + "</div>";
+}
+
+// A complete run may have ended before testing or training (e.g. the base model was kept).
+function skippedSteps(workflow) {
+  if (workflow.status !== "complete") return [];
+  const current = workflow.state || workflow;
+  return [current.baseline_results?.length || current.prompt_trials?.length ? null : 1, Object.keys(current.training_runs || {}).length ? null : 2].filter(index => index !== null);
 }
 
 function setNav() {
@@ -355,6 +363,37 @@ function workflowComparison(comparison) {
   }).join("");
 }
 
+// The final page: every model the run measured, and the fine-tuned adapter to take away.
+function finalSummary(workflow) {
+  const current = workflow.state || workflow, comparison = workflow.comparison || {};
+  const pairs = comparison.pairs || [];
+  const benchmark = (current.model_benchmark?.results || []).filter(result => result.status === "complete");
+  const score = result => {
+    const q = result?.qualityEvidence || {};
+    if (q.coverage !== 1 || !Number.isFinite(q.score) || !q.evaluatedExamples) return "—";
+    return Math.round(q.score * q.evaluatedExamples) + " of " + q.evaluatedExamples + " correct (" + Math.round(q.score * 100) + "%)" + (q.estimated ? "<br><small>graded by the local judge</small>" : "");
+  };
+  const rows = [];
+  const tunedRow = pair => rows.push(["<strong>" + escapeHtml(pair.modelId) + " — fine-tuned</strong>", "Your VM", "—", "<strong>" + score(pair.tuned) + "</strong>"]);
+  for (const result of benchmark) {
+    const pair = pairs.find(item => item.modelId === result.modelId);
+    rows.push([escapeHtml(result.modelId), result.provider === "local" ? "Your VM" : "Hosted, comparison only", score(result), pair ? score(pair.base) : "—"]);
+    if (pair) tunedRow(pair);
+  }
+  for (const pair of pairs.filter(item => !benchmark.some(result => result.modelId === item.modelId))) {
+    rows.push([escapeHtml(pair.modelId), "Your VM", "—", score(pair.base)]);
+    tunedRow(pair);
+  }
+  const verdict = comparison.winner ? "The fine-tune improved on unseen questions — review before deployment." : pairs.length ? "Training finished, but the fine-tune did not clearly beat the base model." : "No model was fine-tuned in this run, so there is no fine-tuned model to export." + (Number.isInteger(comparison.selectedTrial) ? " You chose to keep the base model at prompt review." : "");
+  const trained = pairs.find(pair => pair.modelId === comparison.winner) || pairs.find(pair => pair.passed);
+  // Without a fine-tune there are no unseen-test scores, so that column is left out.
+  const columns = pairs.length ? 4 : 3;
+  const head = ["Model", "Runs on", "Benchmark: correct answers", "Unseen test: correct answers"].slice(0, columns);
+  const table = rows.length ? "<div class='benchmark-table'><table><thead><tr><th>" + head.join("</th><th>") + "</th></tr></thead><tbody>" + rows.map(row => "<tr><td>" + row.slice(0, columns).join("</td><td>") + "</td></tr>").join("") + "</tbody></table></div><p>Each model answered the same " + (current.model_benchmark?.developmentIds?.length || 0) + " benchmark questions; the counts are answers graded correct against the reference. The benchmark picked the model to fine-tune." + (pairs.length ? " The " + (comparison.evaluationIds?.length || 0) + " unseen test questions were never used for picking or training." : "") + "</p>" : "";
+  const exporter = trained?.passed ? "<p><a class='button primary' href='/api/workflow/runs/" + encodeURIComponent(workflow.id) + "/export' download>Export fine-tuned model (.zip)</a> LoRA adapter for " + escapeHtml(trained.modelId) + "; load it on top of that base model with PEFT.</p>" : "";
+  return "<div class='notice'><strong>" + escapeHtml(verdict) + "</strong></div>" + table + exporter + (pairs.length ? "<details class='experiment-example'><summary>Detailed answers and diagnostics</summary>" + workflowComparison(comparison) + "</details>" : "");
+}
+
 function modelPlanRow(id, provider, reason, checked) {
   return `<label class="check-row"><input type="checkbox" data-model="${escapeHtml(id)}" data-provider="${provider === "compass" ? "compass" : "local"}"${checked ? " checked" : ""}><span><strong>${escapeHtml(id)}</strong> · ${provider === "compass" ? "Compass" : "Your VM"}${reason ? "<br>" + escapeHtml(reason) : ""}</span></label>`;
 }
@@ -484,14 +523,16 @@ function renderWorkflow(workflow) {
   if (workflow.dataset?.sampleOnly) action = "<div class='notice'>Hugging Face sample: " + escapeHtml(workflow.dataset.importedRows) + " rows · subset " + escapeHtml(workflow.dataset.hubConfig || "default") + " · split " + escapeHtml(workflow.dataset.hubSplit || "train") + ". Analysis and training use this local sample, not the full Hub dataset.</div>" + action;
   else if (workflow.dataset?.hubRevision) action = "<div class='notice'>Full Hugging Face split: " + escapeHtml(workflow.dataset.importedRows) + " rows · subset " + escapeHtml(workflow.dataset.hubConfig || "default") + " · split " + escapeHtml(workflow.dataset.hubSplit || "train") + ". All imported rows are available to the training/evaluation split. The quality audit samples up to 600 rows.</div>" + action;
   action = datasetProfile(workflow.profile || workflow.state?.profile || pending?.profile) + action;
+  // The final page is only the summary; the dataset audit and earlier checks belong to the earlier steps.
+  if (workflow.status === "complete" && workflow.comparison) action = "";
   const isDone = ["complete", "blocked", "cancelled", "failed", "interrupted"].includes(workflow.status);
   const isRunning = workflow.status !== "waiting" && !isDone;
   if (!isRunning || submittedStep?.workflowId !== workflow.id) submittedStep = null;
   if (isRunning) action += (submittedStep ? "<div id='submitted-step-slot'></div>" : "") + workflowWorking(workflow);
   if (workflow.resumable) action += "<section class='card body-pad'><h2>Resume this run</h2><p>Finished steps are kept. The step that stopped starts again from its beginning, so a model benchmark reruns every model.</p><button class='button primary' id='continue-workflow'>Resume</button></section>";
-  const comparison = workflow.comparison ? "<section class='card body-pad' style='margin-top:16px'><h2>Evaluation summary</h2>" + workflowComparison(workflow.comparison) + (workflow.status === "complete" && workflow.comparison.pairs?.length ? "<button class='button' id='evaluate-accuracy'>Run automatic evaluation</button><p>Grade saved answers on all recorded unseen questions. Training is not repeated.</p>" : "") + (workflow.accuracyError ? "<p role='alert'>" + escapeHtml(workflow.accuracyError) + "</p>" : "") + "</section>" : "";
+  const comparison = workflow.comparison ? "<section class='card body-pad' style='margin-top:16px'><h2>Summary</h2>" + finalSummary(workflow) + (workflow.status === "complete" && workflow.comparison.pairs?.length ? "<button class='button' id='evaluate-accuracy'>Run automatic evaluation</button><p>Grade saved answers on all recorded unseen questions. Training is not repeated.</p>" : "") + (workflow.accuracyError ? "<p role='alert'>" + escapeHtml(workflow.accuracyError) + "</p>" : "") + "</section>" : "";
   app.innerHTML = shell("LangGraph workflow", workflow.status === "waiting" ? "Your review is needed." : workflow.status === "interrupted" ? "This run stopped before it finished." : isDone ? "Workflow results are ready." : workflow.candidate_status === "verified" ? "Evaluating your fine-tune." : "ForgeTune is working.", workflow.status === "waiting" ? "The graph is checkpointed and waiting for your decision." : "Dataset analysis, prompt experiments, and optional fine-tuning are recorded in one resumable workflow.", "<button class='button' id='back-config'>← Datasets</button> <button class='button' id='update-dataset'>Update dataset</button>") +
-    steps(workflow.status === "complete" ? 3 : ["dataset_ready", "data_review", "blocker_resolution"].includes(pending?.type) ? 0 : pending?.type === "plan_approval" || Object.keys(workflow.training_runs || {}).length ? 2 : 1) + "<section class='card body-pad'><div class='section-head' style='padding:0 0 15px'><div><h2>" + escapeHtml(workflow.dataset?.displayName || workflow.state?.dataset?.displayName || "Dataset workflow") + "</h2><p>Task: " + escapeHtml(datasetTasks[workflow.profile?.classification?.task || workflow.state?.profile?.classification?.task] || "Dataset analysis") + " · Candidates: " + (workflow.approved_plan?.candidateCount || workflow.state?.max_candidates || 3) + "</p></div><span class='pill " + (workflow.status === "complete" ? "complete" : "") + "'>" + escapeHtml(workflow.status) + "</span></div><p style='color:var(--muted);font-size:11px;margin-top:12px'>" + (workflow.error ? escapeHtml(workflow.error) : workflow.status === "waiting" ? "No GPU work will start until this checkpoint is resolved." : isDone ? "All available workflow results have been persisted locally." : "The trainer will update this page automatically.") + "</p></section>" + action + comparison + (workflow.status === "complete" ? "<details class='card body-pad' style='margin-top:16px'><summary>Training and prompt/RAG checks</summary>" + workflowTools(workflow) + "</details>" : workflowTools(workflow)) + "</div>";
+    steps(workflow.status === "complete" ? 3 : ["dataset_ready", "data_review", "blocker_resolution"].includes(pending?.type) ? 0 : pending?.type === "plan_approval" || Object.keys(workflow.training_runs || {}).length ? 2 : 1, skippedSteps(workflow)) + "<section class='card body-pad'><div class='section-head' style='padding:0 0 15px'><div><h2>" + escapeHtml(workflow.dataset?.displayName || workflow.state?.dataset?.displayName || "Dataset workflow") + "</h2><p>Task: " + escapeHtml(datasetTasks[workflow.profile?.classification?.task || workflow.state?.profile?.classification?.task] || "Dataset analysis") + " · Candidates: " + (workflow.approved_plan?.candidateCount || workflow.state?.max_candidates || 3) + "</p></div><span class='pill " + (workflow.status === "complete" ? "complete" : "") + "'>" + escapeHtml(workflow.status) + "</span></div><p style='color:var(--muted);font-size:11px;margin-top:12px'>" + (workflow.error ? escapeHtml(workflow.error) : workflow.status === "waiting" ? "No GPU work will start until this checkpoint is resolved." : isDone ? "All available workflow results have been persisted locally." : "The trainer will update this page automatically.") + "</p></section>" + action + comparison + (workflow.status === "complete" && workflow.comparison ? "" : workflowTools(workflow)) + "</div>";
   if (submittedStep) document.querySelector("#submitted-step-slot").replaceWith(submittedStep.node);
   bindWorkflowTools(workflow);
   bindModelPlan(workflow);

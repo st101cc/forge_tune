@@ -904,9 +904,6 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         benchmark=state["model_benchmark"]
         winner=benchmark.get("winner")
         if winner:
-            selected=next(r for r in benchmark["results"] if r["modelId"]==winner)
-            if selected["provider"]=="compass":
-                return {"status":"complete","comparison":{"decision":"keep_baseline","pairs":[],"modelIds":[winner],"instruction":INSTRUCTION,"decisionReason":"The development benchmark selected a hosted Compass model. This model is retained as the baseline; local fine-tuning is not applicable. Validate it on untouched final questions before deployment."}}
             return {"candidates":[c for c in state["candidates"] if c["model"]["id"]==winner],"status":"baseline"}
         response=interrupt({"type":"model_selection","message":benchmark.get("error") or benchmark["reason"],"benchmark":benchmark,"actions":["select_best","regrade","abort"]})
         if not isinstance(response,dict):
