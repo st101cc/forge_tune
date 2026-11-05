@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -18,7 +19,7 @@ import truststore
 truststore.inject_into_ssl()
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from advisor import baseline_compare, cloud_clarify, cloud_status, connection_test, load_source, local_profile, rank_candidates
@@ -825,6 +826,35 @@ async def get_workflow(workflow_id: str) -> dict:
                 run["trainingContext"] = json.loads(context_path.read_text(encoding="utf-8"))
             training_records.append(run)
     return public_workflow({**state, **record, "state":state, "trainingRecords":training_records, "progress":progress, "resumable":await workflow_resumable(workflow_id, record)})
+
+
+def adapter_archive(run_dir: Path) -> Path:
+    """Zips the trained LoRA adapter once; the per-epoch checkpoint folders (optimizer state) stay out."""
+    archive = run_dir / "exports" / "adapter.zip"
+    if not archive.exists():
+        archive.parent.mkdir(exist_ok=True)
+        partial = archive.with_suffix(".partial")
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for path in (run_dir / "adapter").iterdir():
+                if path.is_file():
+                    bundle.write(path, path.name)
+        partial.replace(archive)
+    return archive
+
+
+@app.get("/workflow/runs/{workflow_id}/export")
+async def export_workflow_adapter(workflow_id: str) -> FileResponse:
+    record = read_workflow(workflow_id)
+    comparison = record.get("comparison") or record.get("state", {}).get("comparison") or {}
+    model_id = comparison.get("winner") or next((pair["modelId"] for pair in comparison.get("pairs", []) if pair.get("passed")), None)
+    runs = [json.loads(path.read_text(encoding="utf-8")) for path in RUNS_ROOT.glob("*/run.json")]
+    runs = [run for run in runs if model_id and run.get("workflowId") == workflow_id and run.get("status") == "complete"
+            and run.get("config", {}).get("base_model") == model_id and (run_path(run["id"]).parent / "adapter").is_dir()]
+    if not runs:
+        raise HTTPException(404, "This run has no verified fine-tuned adapter to export.")
+    run_dir = run_path(max(runs, key=lambda run: run.get("completedAt") or "")["id"]).parent
+    archive = await asyncio.to_thread(adapter_archive, run_dir)
+    return FileResponse(archive, media_type="application/zip", filename=model_id.split("/")[-1] + "-fine-tuned-adapter.zip")
 
 
 async def workflow_resumable(workflow_id: str, record: dict) -> bool:

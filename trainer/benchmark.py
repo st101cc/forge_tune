@@ -44,12 +44,16 @@ def select_model(results, ids):
         return {**summary,"reason":"Models must use the same correctness metric or shared review rubric."}
     if any(not comparable_evidence(complete[0], r) for r in complete[1:]):
         return {**summary,"reason":"Models must use the same judge version and rubric."}
-    known_cost = all(number(r.get("costUsd")) and r["costUsd"] >= 0 for r in complete)
-    best=max(r["qualityEvidence"]["score"] for r in complete)
+    # ForgeTune fine-tunes models on the user's VM; hosted (Compass) models are only a bar to compare against.
+    local=[r for r in complete if r.get("provider")=="local"]
+    if not local:
+        return {**summary,"reason":"No model on your VM completed the benchmark. ForgeTune fine-tunes local models; hosted models are for comparison only."}
+    best=max(r["qualityEvidence"]["score"] for r in local)
     # ponytail: fixed 2-point tolerance; add confidence intervals for larger benchmarks.
-    contenders=[r for r in complete if r["qualityEvidence"]["score"] >= best - .02]
-    winner=min(contenders,key=lambda r: (r["costUsd"] if known_cost else 0,r["meanLatencySeconds"],r["modelId"]))
-    return {**summary,"winner":winner["modelId"],"status":"selected","costUsed":known_cost,"reason":"Highest measured correctness, with cost then latency breaking ties within 2 percentage points." + (" Cost not compared: a Compass model reported no price." if not known_cost else " Cost uses the charges Compass reported; models on your VM count as free." if any(r.get("provider")=="compass" for r in complete) else " All models ran on your VM, so cost is free for each.")}
+    contenders=[r for r in local if r["qualityEvidence"]["score"] >= best - .02]
+    winner=min(contenders,key=lambda r: (r["meanLatencySeconds"],r["modelId"]))
+    hosted=max((r for r in complete if r.get("provider")!="local"),key=lambda r: r["qualityEvidence"]["score"],default=None)
+    return {**summary,"winner":winner["modelId"],"status":"selected","reason":"Best local model to fine-tune: highest measured correctness, with faster answers breaking ties within 2 percentage points." + (f" Hosted models are for comparison only; the best, {hosted['modelId']}, scored {hosted['qualityEvidence']['score']:.0%}." if hosted else "")}
 
 
 def apply_review(results, response, prices):

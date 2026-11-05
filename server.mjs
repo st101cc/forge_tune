@@ -17,7 +17,10 @@ async function callTrainer(path, request) {
     body: ["GET", "HEAD"].includes(request.method) ? undefined : request,
     duplex: ["GET", "HEAD"].includes(request.method) ? undefined : "half"
   });
-  return { status: response.status, type: response.headers.get("content-type") || "application/json", body: Buffer.from(await response.arrayBuffer()) };
+  const headers = { "content-type": response.headers.get("content-type") || "application/json" };
+  // Downloads (the adapter export) keep their filename.
+  if (response.headers.has("content-disposition")) headers["content-disposition"] = response.headers.get("content-disposition");
+  return { status: response.status, headers, body: Buffer.from(await response.arrayBuffer()) };
 }
 
 const server = createServer(async (request, response) => {
@@ -25,7 +28,7 @@ const server = createServer(async (request, response) => {
   if (url.pathname === "/api/hardware") {
     try {
       const result = await callTrainer("/hardware", request);
-      response.writeHead(result.status, { "content-type": result.type }); response.end(result.body);
+      response.writeHead(result.status, result.headers); response.end(result.body);
     } catch {
       response.writeHead(200, {"content-type":"application/json"});
       response.end(JSON.stringify({name:"GPU not detected", memoryGb:0, trainerOnline:false}));
@@ -35,7 +38,7 @@ const server = createServer(async (request, response) => {
   if (url.pathname.startsWith("/api/")) {
     try {
       const result = await callTrainer(url.pathname.slice(4) + url.search, request);
-      response.writeHead(result.status, { "content-type": result.type }); response.end(result.body);
+      response.writeHead(result.status, result.headers); response.end(result.body);
     } catch {
       response.writeHead(503, {"content-type":"application/json"});
       response.end(JSON.stringify({detail:"The WSL trainer is offline. Start trainer/start.sh, then try again."}));
