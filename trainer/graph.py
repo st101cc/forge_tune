@@ -908,10 +908,24 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
             if selected["provider"]=="compass":
                 return {"status":"complete","comparison":{"decision":"keep_baseline","pairs":[],"modelIds":[winner],"instruction":INSTRUCTION,"decisionReason":"The development benchmark selected a hosted Compass model. This model is retained as the baseline; local fine-tuning is not applicable. Validate it on untouched final questions before deployment."}}
             return {"candidates":[c for c in state["candidates"] if c["model"]["id"]==winner],"status":"baseline"}
-        response=interrupt({"type":"model_selection","message":benchmark.get("error") or benchmark["reason"],"benchmark":benchmark,"actions":["select_best","abort"]})
+        response=interrupt({"type":"model_selection","message":benchmark.get("error") or benchmark["reason"],"benchmark":benchmark,"actions":["select_best","regrade","abort"]})
         if not isinstance(response,dict):
             return {"model_benchmark":{**benchmark,"error":"Review the model benchmark."}}
         if response.get("action")=="abort": return {"status":"cancelled"}
+        if response.get("action")=="regrade":
+            # Grades the saved answers again (e.g. after a grader fix) without asking any model again.
+            ref=state["dataset"]
+            dataset=load_source(ref["source"],ref["name"],ref.get("extension"))
+            graded=sum(len(r.get("evaluationIds",[])) for r in benchmark["results"] if r.get("status")=="complete")
+            try:
+                progress=counted_progress(state,f"Regrading the saved answers with {state.get('evaluator_model') or DEFAULT_MODEL}",0,graded)
+                results=await grade_results(state,dataset,benchmark["results"],INSTRUCTION,on_progress=progress)
+            finally:
+                clear_progress(state)
+            results,prices=apply_review(results,{},benchmark.get("prices",{}))
+            summary=select_model(results,benchmark["developmentIds"])
+            summary["accuracyReview"]=accuracy_agent_review(results)
+            return {"model_benchmark":{**benchmark,"results":results,**summary,"prices":prices,"error":None},"status":"awaiting_model_selection"}
         try:
             results=benchmark["results"]
             if response.get("action")!="select_best": raise ValueError("Choose a benchmark action.")
