@@ -80,7 +80,10 @@ class Hyperparameters(BaseModel):
     epochs: int = Field(default=3, ge=1, le=10)
     batch_size: int = Field(default=1, ge=1, le=16)
     gradient_accumulation: int = Field(default=8, ge=1, le=128)
-    max_sequence_length: int = Field(default=2048, ge=128, le=8192)
+    # With the chunked training loss, a real 3B QLoRA run at 12,288 tokens peaked at 11.3 GiB on a 15 GB T4.
+    max_sequence_length: int = Field(default=2048, ge=128, le=12288)
+    # Keep <think> reasoning in training targets instead of training only the solution after it.
+    train_on_reasoning: bool = False
 
 
 class RunRequest(BaseModel):
@@ -1091,14 +1094,43 @@ async def paperclip_heartbeat(wake: PaperclipWake, authorization: str = Header(d
     return {"accepted": True}
 
 
+def _tally(result: dict) -> dict:
+    samples = result.get("samples") or []
+    verdicts = [(sample.get("grade") or {}).get("verdict") for sample in samples]
+    return {"correct": verdicts.count("pass"), "incorrect": verdicts.count("fail"), "needGrade": len(verdicts) - verdicts.count("pass") - verdicts.count("fail"),
+            "loopsStopped": sum(bool(sample.get("stoppedRepeating")) for sample in samples), "cutOff": sum(bool(sample.get("hitTokenLimit")) for sample in samples),
+            "answerSeconds": result.get("latencySeconds") or result.get("inferenceSeconds")}
+
+
+def with_correctness(run: dict) -> dict:
+    """Adds the base and fine-tuned models' correct/incorrect counts on the unseen test questions, from the run's workflow.
+
+    Cached in run.json and refreshed whenever the workflow file changes (e.g. after grading)."""
+    path = workflow_path(run["workflowId"]) if run.get("workflowId") else None
+    if run.get("status") != "complete" or not path or not path.exists():
+        return run
+    updated = path.stat().st_mtime
+    if (run.get("correctness") or {}).get("workflowUpdated") == updated:
+        return run
+    record = json.loads(path.read_text(encoding="utf-8"))
+    comparison = record.get("comparison") or record.get("state", {}).get("comparison") or {}
+    pair = next((item for item in comparison.get("pairs", []) if item.get("modelId") == run.get("config", {}).get("base_model")), None)
+    if not pair:
+        return run
+    run["correctness"] = {"workflowUpdated": updated, "questions": len(pair["tuned"].get("evaluationIds") or pair["base"].get("evaluationIds") or []),
+                          "base": _tally(pair["base"]), "tuned": _tally(pair["tuned"])}
+    write_run(run)  # The run is complete, so nothing else writes run.json now.
+    return run
+
+
 @app.get("/runs")
 async def list_runs() -> list[dict]:
-    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(RUNS_ROOT.glob("*/run.json"), reverse=True)]
+    return [with_correctness(json.loads(path.read_text(encoding="utf-8"))) for path in sorted(RUNS_ROOT.glob("*/run.json"), reverse=True)]
 
 
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str) -> dict:
-    return read_run(run_id)
+    return with_correctness(read_run(run_id))
 
 
 @app.get("/runs/{run_id}/logs")
