@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -952,7 +953,10 @@ PAPERCLIP_UNBLOCK = {
     "waiting": "Answer the review in forge-tune, then comment here.",
     "failed": "Fix the problem in forge-tune (resume the run there, then comment here), or open a new issue.",
     "interrupted": "Resume the run in forge-tune, then comment here, or open a new issue.",
+    "blocked": "The workflow stopped (see the error). Open a new issue to try again.",
 }
+# Optional agents that take over when a workflow pauses for review or completes.
+PAPERCLIP_HAND_OFF = {"waiting": ("PAPERCLIP_REVIEWER_AGENT_ID", "Review"), "complete": ("PAPERCLIP_LEAD_AGENT_ID", "Decide next step for")}
 paperclip_starting: set[str] = set()
 paperclip_watchers: dict[str, asyncio.Task] = {}
 
@@ -963,11 +967,12 @@ class PaperclipWake(BaseModel):
     context: dict = Field(default_factory=dict)
 
 
-def paperclip_call(method: str, path: str, run_id: str, body: dict | None = None) -> dict:
+def paperclip_call(method: str, path: str, run_id: str, body: dict | None = None, idempotency_key: str = "") -> dict:
     request = urllib.request.Request(os.environ["PAPERCLIP_API_URL"].rstrip("/") + path, method=method,
         data=None if body is None else json.dumps(body).encode(),
         headers={"Authorization": "Bearer " + os.environ["PAPERCLIP_API_KEY"], "Content-Type": "application/json",
-                 **({"X-Paperclip-Run-Id": run_id} if run_id else {})})
+                 **({"X-Paperclip-Run-Id": run_id} if run_id else {}),
+                 **({"Idempotency-Key": idempotency_key} if idempotency_key else {})})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read() or b"{}")
@@ -1027,12 +1032,23 @@ def paperclip_report(issue_id: str, workflow_id: str, wake: PaperclipWake) -> No
     winner = (record.get("state", {}).get("comparison") or {}).get("winner")
     if winner:
         lines.append(f"Winning model: `{winner}`. Adapter: `GET /workflow/runs/{workflow_id}/export` on the trainer.")
-    if record.get("error"):
-        lines.append("Error: " + record["error"])
+    error = record.get("error") or ((record.get("state", {}).get("errors") or [""])[-1] if status == "blocked" else "")
+    if error:
+        lines.append("Error: " + error)
     if record.get("pendingAction"):
         lines.append("Waiting for review in forge-tune: " + str(record["pendingAction"].get("message", "")))
     unblock = PAPERCLIP_UNBLOCK.get(status, f"Wait for forge-tune workflow {workflow_id}; the trainer wakes this agent when it finishes.")
-    paperclip_update(issue_id, wake, "done" if status == "complete" else "blocked", "\n\n".join(lines), unblock)
+    paperclip_update(issue_id, wake, {"complete": "done", "cancelled": "cancelled"}.get(status, "blocked"), "\n\n".join(lines), unblock)
+    env_name, verb = PAPERCLIP_HAND_OFF.get(status, ("", ""))
+    if env_name and (agent_id := os.environ.get(env_name)):
+        # The key makes repeat wakes for the same pause or result reuse the issue instead of opening another.
+        # ponytail: Paperclip expires idempotency keys, so a much later wake may open a second hand-off issue.
+        key = hashlib.sha256(json.dumps([workflow_id, status, record.get("pendingAction")], sort_keys=True, default=str).encode()).hexdigest()
+        company_id = paperclip_call("GET", f"/api/issues/{issue_id}", wake.runId)["companyId"]
+        paperclip_call("POST", f"/api/companies/{company_id}/issues", wake.runId, {
+            "title": f"{verb} forge-tune workflow {workflow_id[:8]}", "status": "todo", "assigneeAgentId": agent_id, "parentId": issue_id,
+            "description": f"forge-tune workflow `{workflow_id}` is **{status}**.\n\nDetails: `GET /workflow/runs/{workflow_id}` on the trainer."},
+            idempotency_key=key)
 
 
 async def handle_paperclip_wake(wake: PaperclipWake) -> None:
