@@ -691,7 +691,7 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
                 continue
             action = response.get("action")
             if action == "abort":
-                return {"status": "blocked", "pending_action": None}
+                return {"status": "blocked", "pending_action": None, "errors": state.get("errors", []) + ["Workflow aborted during data review."]}
             if action == "replace_dataset":
                 dataset = response.get("dataset")
                 if not isinstance(dataset, dict) or not dataset.get("source") or not dataset.get("name"):
