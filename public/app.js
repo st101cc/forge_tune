@@ -687,16 +687,28 @@ function evaluate(id) {
   document.querySelectorAll("[data-export]").forEach(button => button.onclick = () => toast(button.dataset.export === "gguf" ? "GGUF conversion queued" : "Adapter package ready", button.dataset.export === "gguf" ? "The local trainer will merge and convert weights when it is online." : "Includes adapter_model.safetensors and adapter_config.json."));
 }
 
+// Correct/incorrect answers on the run's unseen test questions, recorded by its workflow; loss is not answer accuracy.
+function correctnessTable(run) {
+  const result = run.correctness;
+  if (!result) return "<p>" + (run.status === "complete" ? "No answer correctness was recorded for this run. Runs started from a workflow are graded on unseen test questions." : "Correct and incorrect answers appear after training, once the fine-tuned model has answered the unseen test questions.") + "</p>";
+  const row = (name, item) => "<tr><td>" + name + "</td><td>" + item.correct + "</td><td>" + item.incorrect + "</td><td>" + item.needGrade + "</td><td>" + item.loopsStopped + "</td><td>" + (Number.isFinite(item.answerSeconds) ? Math.round(item.answerSeconds).toLocaleString() + " s" : "—") + "</td></tr>";
+  return "<div class='benchmark-table'><table><thead><tr><th>Model</th><th>Correct</th><th>Incorrect</th><th>Need your grade</th><th>Loops stopped</th><th>Answering time</th></tr></thead><tbody>" +
+    row("Base " + escapeHtml(runModelLabel(run)), result.base) + row("<strong>Fine-tuned</strong>", result.tuned) + "</tbody></table></div><p>" + result.questions + " unseen test questions, never used for training; the same questions and grading for both models.</p>";
+}
+
+function correctnessLine(run) {
+  const result = run.correctness;
+  return result ? "fine-tuned " + result.tuned.correct + "/" + result.questions + " correct (base " + result.base.correct + "/" + result.questions + ")" : "correctness not recorded";
+}
+
 function runDetails(id) {
   const run = state.runs.find(item => item.id === id);
   if (!run) return syncServerRuns().catch(() => false).then(() => state.runs.some(item => item.id === id) ? runDetails(id) : location.hash = "#/runs");
   const isComplete = run.status === "complete";
-  const loss = Number.isFinite(run.loss) ? run.loss.toFixed(2) : "—";
-  const perplexity = Number.isFinite(run.perplexity) ? run.perplexity.toFixed(2) : "Pending";
   const artifacts = isComplete ? "Adapter, metrics, and evaluation report verified" : run.status === "failed" ? "No verified artifacts" : "Artifacts will appear when the run completes";
   app.innerHTML = shell("Training run details", runTitle(run), "A durable record of the dataset, configuration, progress, metrics, and local artifacts for this run.", "<button class='button' id='back-history'>← Training history</button>") +
     "<section class='card details-card'><div class='section-head'><div><h2>" + escapeHtml(runTitle(run)) + "</h2><p>Run ID: " + escapeHtml(run.id) + "</p></div><span class='pill " + runStatusClass(run) + "'>" + escapeHtml(run.status) + "</span></div><div class='details-grid'><div><span>Dataset used</span><strong>" + escapeHtml(runDatasetLabel(run)) + "</strong></div><div><span>Base model</span><strong>" + escapeHtml(runModelLabel(run)) + "</strong></div><div><span>Fine-tuning method</span><strong>" + escapeHtml((run.method || "unknown").toUpperCase()) + "</strong></div><div><span>Started</span><strong>" + escapeHtml(run.startedAt || "Not recorded") + "</strong></div><div><span>Training framework</span><strong>" + escapeHtml(run.framework || "Not recorded") + "</strong></div><div><span>Elapsed time</span><strong>" + Math.floor((run.elapsed || 0) / 60) + "m " + ((run.elapsed || 0) % 60) + "s</strong></div></div></section>" +
-    "<section class='card' style='margin-top:16px'><div class='section-head'><div><h2>Training and evaluation</h2><p>Metrics recorded for this run only.</p></div></div><div class='metric-grid grid'><div class='metric'><span>Validation loss</span><strong>" + loss + "</strong></div><div class='metric'><span>Perplexity</span><strong>" + perplexity + "</strong></div><div class='metric'><span>Progress</span><strong>" + (run.progress || 0) + "%</strong></div></div></section>" +
+    "<section class='card body-pad' style='margin-top:16px'><h2>Answer correctness</h2>" + correctnessTable(run) + (isComplete ? "" : "<p>Progress: " + (run.progress || 0) + "%</p>") + "</section>" +
     "<section class='card history-artifacts' style='margin-top:16px'><h2>Local artifacts</h2><p>" + escapeHtml(artifacts) + "</p><div class='progress'><i style='width:" + (isComplete ? 100 : run.progress || 0) + "%'></i></div></section></div>";
   document.querySelector("#back-history").onclick = () => location.hash = "#/runs";
 }
@@ -709,7 +721,7 @@ async function syncServerRuns() {
     const config = remote.config || {};
     const fields = {id:remote.id, remote:true, status:remote.status, model:config.base_model, method:config.parameter_method,
       dataset:config.dataset?.displayName || config.dataset?.name, startedAt:remote.startedAt || remote.createdAt, framework:remote.framework,
-      loss:remote.metrics?.eval_loss, perplexity:remote.metrics?.perplexity, progress:remote.status === "complete" ? 100 : undefined, workflowId:remote.workflowId,
+      loss:remote.metrics?.eval_loss, perplexity:remote.metrics?.perplexity, progress:remote.status === "complete" ? 100 : undefined, workflowId:remote.workflowId, correctness:remote.correctness,
       elapsed:remote.startedAt && remote.completedAt ? Math.round((Date.parse(remote.completedAt) - Date.parse(remote.startedAt)) / 1000) : undefined};
     Object.keys(fields).forEach(key => fields[key] === undefined && delete fields[key]);
     const local = state.runs.find(run => run.id === remote.id);
@@ -722,7 +734,7 @@ async function syncServerRuns() {
 
 function runs() {
   if (!runs.synced) { runs.synced = true; syncServerRuns().then(ok => ok && route() === "runs" && runs()).catch(() => {}).finally(() => { runs.synced = false; }); }
-  const body = state.runs.length ? state.runs.map(run => "<div class='run'><div><strong>" + escapeHtml(runTitle(run)) + "</strong><span><b>Dataset:</b> " + escapeHtml(runDatasetLabel(run)) + " · " + escapeHtml(run.startedAt || "date not recorded") + " · val loss " + (Number.isFinite(run.loss) ? run.loss.toFixed(2) : "—") + "</span></div><div class='run-actions'><span class='pill " + runStatusClass(run) + "'>" + escapeHtml(run.status) + "</span><button class='button' data-open='" + run.id + "'>View details</button></div></div>").join("") : "<div class='empty'><strong>No training runs yet</strong>Start with a dataset and safe QLoRA preset.</div>";
+  const body = state.runs.length ? state.runs.map(run => "<div class='run'><div><strong>" + escapeHtml(runTitle(run)) + "</strong><span><b>Dataset:</b> " + escapeHtml(runDatasetLabel(run)) + " · " + escapeHtml(run.startedAt || "date not recorded") + " · " + correctnessLine(run) + "</span></div><div class='run-actions'><span class='pill " + runStatusClass(run) + "'>" + escapeHtml(run.status) + "</span><button class='button' data-open='" + run.id + "'>View details</button></div></div>").join("") : "<div class='empty'><strong>No training runs yet</strong>Start with a dataset and safe QLoRA preset.</div>";
   app.innerHTML = shell("Training runs", "Your local training history.", "Each run keeps its dataset reference, method, metrics, and artifacts on this computer.", "<button class='button primary' id='new-run'>+ New fine-tune</button>") + "<section class='card run-list'>" + body + "</section></div>";
   document.querySelector("#new-run").onclick = () => location.hash = "#/workspace";
   document.querySelectorAll("[data-open]").forEach(button => button.onclick = () => {
