@@ -413,17 +413,46 @@ def _repeating(tokens: list[int]) -> bool:
     return False
 
 
-def _stop_repeating(prompt_length: int, torch: Any) -> Any:
-    """Greedy decoding can repeat a block forever without ending; stop only those answers, checking every 32 tokens."""
+# Measured on 250 saved Qwen answers: one that kept re-solving its question ("Solution 2" ... "Solution 27", never
+# repeating a block exactly) had 97-100% of its last 2,048 tokens made of 32-token phrases it had already written;
+# every other answer stayed at or below 56% (row-by-row trial and error is the highest).
+PHRASE_TOKENS, REWRITE_WINDOW, REWRITE_SHARE = 32, 2048, 0.8
+
+
+def _rewriting(tokens: list[int]) -> bool:
+    """True when most of the last REWRITE_WINDOW tokens restate 32-token phrases written earlier in the answer."""
+    start = len(tokens) - PHRASE_TOKENS + 1 - REWRITE_WINDOW  # First phrase position inside the window.
+    if start < 0:
+        return False
+    seen, repeated = set(), 0
+    for position in range(len(tokens) - PHRASE_TOKENS + 1):
+        phrase = tuple(tokens[position:position + PHRASE_TOKENS])
+        repeated += position >= start and phrase in seen
+        seen.add(phrase)
+    return repeated >= REWRITE_SHARE * REWRITE_WINDOW
+
+
+def _looping(tokens: list[int]) -> bool:
+    return _repeating(tokens) or _rewriting(tokens)
+
+
+def _stop_repeating(prompt_length: int, torch: Any, ends: set[int]) -> Any:
+    """Greedy decoding can loop without ending: stop exact repeats (checked every 32 tokens) and answers that keep
+    rewriting themselves (every 256 tokens, the costlier check); every other answer runs until the model ends it."""
     from transformers import StoppingCriteria
 
     class StopRepeating(StoppingCriteria):
         def __call__(self, input_ids, scores, **kwargs):
             done = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-            if (input_ids.shape[1] - prompt_length) % 32 == 0:
+            generated = input_ids.shape[1] - prompt_length
+            if generated % 32 == 0:
                 tails = input_ids[:, max(prompt_length, input_ids.shape[1] - 3 * LOOP_TOKENS):].tolist()
                 for row, tokens in enumerate(tails):
                     done[row] = _repeating(tokens)
+            if generated % 256 == 0 and generated >= REWRITE_WINDOW + PHRASE_TOKENS:
+                for row, tokens in enumerate(input_ids[:, prompt_length:].tolist()):
+                    if not done[row] and tokens[-1] not in ends:  # An ended answer is only padding now.
+                        done[row] = _rewriting(tokens)
             return done
 
     return StopRepeating()
@@ -433,6 +462,8 @@ def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], torch: Any, 
     """Greedy answers for several prompts in one generate call: decoding is memory-bound, so a batch costs about one answer's time.
 
     Without max_new_tokens an answer runs until the model ends it, its context is full, or it loops."""
+    ends = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    ends = {tokenizer.eos_token_id, *(ends if isinstance(ends, list) else [ends] if ends is not None else [])}
     output = None
     try:
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(model.device)
@@ -440,7 +471,7 @@ def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], torch: Any, 
         context = getattr(getattr(model, "config", None), "max_position_embeddings", None) or 32768
         with torch.no_grad():
             output = model.generate(**inputs, max_new_tokens=max_new_tokens or context - prompt_length, do_sample=False, pad_token_id=tokenizer.eos_token_id,
-                                    stopping_criteria=[_stop_repeating(prompt_length, torch)])
+                                    stopping_criteria=[_stop_repeating(prompt_length, torch, ends)])
     except torch.cuda.OutOfMemoryError:
         if len(prompts) == 1:
             raise
@@ -451,15 +482,14 @@ def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], torch: Any, 
         torch.cuda.empty_cache()
         half = len(prompts) // 2
         return _generate_batch(model, tokenizer, prompts[:half], torch, max_new_tokens) + _generate_batch(model, tokenizer, prompts[half:], torch, max_new_tokens)
-    ends = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
-    ends = {tokenizer.eos_token_id, *(ends if isinstance(ends, list) else [ends] if ends is not None else [])}
     answers = []
     for row in output:
         new = [int(token) for token in row[prompt_length:]]
         ended = next((i for i, token in enumerate(new) if token in ends), None)
         if ended is not None:
             new = new[:ended]  # Answers that end early are padded to the batch's length.
-        looping = ended is None and _repeating(new)
+        # An answer the loop check stopped is padded the same way, so it is told apart by its loop, not its ending.
+        looping = _looping(new)
         answers.append({"text": tokenizer.decode(new, skip_special_tokens=True), "hitTokenLimit": ended is None and not looping, "stoppedRepeating": looping})
     return answers
 
