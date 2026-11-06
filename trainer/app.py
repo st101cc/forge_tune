@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.request
 import uuid
 import zipfile
@@ -21,7 +22,7 @@ import truststore
 # Trust the OS certificate store so downloads work behind TLS-inspecting proxies and antivirus.
 truststore.inject_into_ssl()
 
-from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -944,9 +945,16 @@ async def resume_workflow(workflow_id: str, request: WorkflowResumeRequest) -> d
 
 
 # Paperclip (https://github.com/paperclipai/paperclip) "http" adapter: an issue assigned to the forge-tune
-# agent starts a workflow from the JSON request in its description; the result goes back as a comment.
-PAPERCLIP_STATUS = {"complete": "done", "failed": "blocked", "interrupted": "blocked", "waiting": "blocked"}
+# agent starts a workflow from the JSON request in its description. Paperclip ends a run as soon as the
+# webhook answers and accepts status changes only from a live run, so every wake leaves the issue "done"
+# or "blocked" on the agent with the workflow's state, and a finished workflow asks Paperclip for a new wake.
+PAPERCLIP_UNBLOCK = {
+    "waiting": "Answer the review in forge-tune, then comment here.",
+    "failed": "Fix the problem in forge-tune (resume the run there, then comment here), or open a new issue.",
+    "interrupted": "Resume the run in forge-tune, then comment here, or open a new issue.",
+}
 paperclip_starting: set[str] = set()
+paperclip_watchers: dict[str, asyncio.Task] = {}
 
 
 class PaperclipWake(BaseModel):
@@ -958,9 +966,13 @@ class PaperclipWake(BaseModel):
 def paperclip_call(method: str, path: str, run_id: str, body: dict | None = None) -> dict:
     request = urllib.request.Request(os.environ["PAPERCLIP_API_URL"].rstrip("/") + path, method=method,
         data=None if body is None else json.dumps(body).encode(),
-        headers={"Authorization": "Bearer " + os.environ["PAPERCLIP_API_KEY"], "X-Paperclip-Run-Id": run_id, "Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read() or b"{}")
+        headers={"Authorization": "Bearer " + os.environ["PAPERCLIP_API_KEY"], "Content-Type": "application/json",
+                 **({"X-Paperclip-Run-Id": run_id} if run_id else {})})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        raise OSError(f"{method} {path} answered {error.code}: {error.read().decode(errors='replace')[:300]}") from error
 
 
 def paperclip_issues() -> dict:
@@ -970,8 +982,8 @@ def paperclip_issues() -> dict:
         return {}
 
 
-def save_paperclip_issue(issue_id: str, entry: dict) -> None:
-    (DATA_ROOT / "paperclip-issues.json").write_text(json.dumps({**paperclip_issues(), issue_id: entry}, indent=2), encoding="utf-8")
+def save_paperclip_issue(issue_id: str, workflow_id: str) -> None:
+    (DATA_ROOT / "paperclip-issues.json").write_text(json.dumps({**paperclip_issues(), issue_id: workflow_id}, indent=2), encoding="utf-8")
 
 
 def paperclip_workflow_request(issue: dict) -> WorkflowRequest:
@@ -980,64 +992,86 @@ def paperclip_workflow_request(issue: dict) -> WorkflowRequest:
     return WorkflowRequest.model_validate_json(match.group(1) if match else text)
 
 
-def paperclip_report(issue_id: str, entry: dict) -> None:
-    """Posts a finished (or paused) workflow back once per status."""
-    record = read_workflow(entry["workflowId"])
+def paperclip_update(issue_id: str, wake: PaperclipWake, status: str, comment: str, unblock: str = "") -> None:
+    # Paperclip takes status changes only from the live run that has the issue checked out, and "blocked"
+    # must name an unblock owner; an agent may only name itself, so a person's comment wakes it to continue.
+    paperclip_call("POST", f"/api/issues/{issue_id}/checkout", wake.runId,
+        {"agentId": wake.agentId, "expectedStatuses": ["backlog", "todo", "in_progress", "in_review", "blocked"]})
+    body = {"status": status, "comment": comment}
+    if status == "blocked":
+        body["unblockDescriptor"] = {"owner": {"agentId": wake.agentId}, "action": unblock}
+    paperclip_call("PATCH", f"/api/issues/{issue_id}", wake.runId, body)
+
+
+async def paperclip_wake_when_done(issue_id: str, agent_id: str, workflow_id: str) -> None:
+    # ponytail: lost on a trainer restart; a comment on the issue wakes the agent and reports the result.
+    if task := active_workflows.get(workflow_id):
+        await asyncio.wait({task})
+    try:
+        await asyncio.to_thread(paperclip_call, "POST", f"/api/agents/{agent_id}/wakeup", "", {"source": "automation",
+            "triggerDetail": "callback", "reason": "forge-tune workflow finished", "payload": {"issueId": issue_id}})
+    except OSError as error:
+        print(f"Paperclip wakeup for issue {issue_id} failed: {error}", file=sys.stderr)
+
+
+def paperclip_watch(issue_id: str, agent_id: str, workflow_id: str) -> None:
+    if workflow_id in active_workflows and workflow_id not in paperclip_watchers:
+        paperclip_watchers[workflow_id] = asyncio.create_task(paperclip_wake_when_done(issue_id, agent_id, workflow_id))
+        paperclip_watchers[workflow_id].add_done_callback(lambda task: paperclip_watchers.pop(workflow_id, None))
+
+
+def paperclip_report(issue_id: str, workflow_id: str, wake: PaperclipWake) -> None:
+    record = read_workflow(workflow_id)
     status = record.get("status")
-    if status not in PAPERCLIP_STATUS or entry.get("reported") == status:
-        return
+    lines = [f"forge-tune workflow `{workflow_id}` is **{status}**."]
     winner = (record.get("state", {}).get("comparison") or {}).get("winner")
-    lines = [f"forge-tune workflow `{record['id']}` finished as **{status}**."]
     if winner:
-        lines.append(f"Winning model: `{winner}`. Adapter: `GET /workflow/runs/{record['id']}/export` on the trainer.")
+        lines.append(f"Winning model: `{winner}`. Adapter: `GET /workflow/runs/{workflow_id}/export` on the trainer.")
     if record.get("error"):
         lines.append("Error: " + record["error"])
     if record.get("pendingAction"):
         lines.append("Waiting for review in forge-tune: " + str(record["pendingAction"].get("message", "")))
-    paperclip_call("PATCH", f"/api/issues/{issue_id}", entry["runId"], {"status": PAPERCLIP_STATUS[status], "comment": "\n\n".join(lines)})
-    save_paperclip_issue(issue_id, {**entry, "reported": status})
+    unblock = PAPERCLIP_UNBLOCK.get(status, f"Wait for forge-tune workflow {workflow_id}; the trainer wakes this agent when it finishes.")
+    paperclip_update(issue_id, wake, "done" if status == "complete" else "blocked", "\n\n".join(lines), unblock)
 
 
 async def handle_paperclip_wake(wake: PaperclipWake) -> None:
+    """Runs inside the wake request, while the Paperclip run is still live."""
     issue_id = wake.context.get("taskId")
     if not issue_id or issue_id in paperclip_starting:
         return
-    entry = paperclip_issues().get(issue_id)
-    try:
-        if entry is None:
-            paperclip_starting.add(issue_id)
+    workflow_id = paperclip_issues().get(issue_id)
+    if workflow_id is None:
+        paperclip_starting.add(issue_id)
+        try:
             issue = await asyncio.to_thread(paperclip_call, "GET", f"/api/issues/{issue_id}", wake.runId)
             try:
-                record = await create_workflow(paperclip_workflow_request(issue))
+                workflow_id = (await create_workflow(paperclip_workflow_request(issue)))["id"]
             except (ValueError, HTTPException) as error:
                 detail = str(getattr(error, "detail", "") or error)[:1500]
-                await asyncio.to_thread(paperclip_call, "PATCH", f"/api/issues/{issue_id}", wake.runId, {"status": "blocked",
-                    "comment": "Put a forge-tune workflow request (the `POST /workflow/runs` JSON body) in the issue description.\n\n" + detail})
+                await asyncio.to_thread(paperclip_update, issue_id, wake, "blocked",
+                    "The issue description has no valid forge-tune workflow request.\n\n" + detail,
+                    "Put the `POST /workflow/runs` JSON body in the description, then comment here.")
                 return
-            entry = {"workflowId": record["id"], "runId": wake.runId, "reported": None}
-            save_paperclip_issue(issue_id, entry)
-            await asyncio.to_thread(paperclip_call, "PATCH", f"/api/issues/{issue_id}", wake.runId,
-                {"status": "in_progress", "comment": f"Started forge-tune workflow `{record['id']}`."})
-        else:
-            entry = {**entry, "runId": wake.runId}
-        # ponytail: a run resumed in the forge-tune UI after a restart or review is reported on the issue's next wake.
-        if task := active_workflows.get(entry["workflowId"]):
-            await asyncio.wait({task})
-        await asyncio.to_thread(paperclip_report, issue_id, entry)
-    except Exception as error:
-        print(f"Paperclip wake for issue {issue_id} failed: {error}", file=sys.stderr)
-    finally:
-        paperclip_starting.discard(issue_id)
+            save_paperclip_issue(issue_id, workflow_id)
+        finally:
+            paperclip_starting.discard(issue_id)
+    paperclip_watch(issue_id, wake.agentId, workflow_id)
+    await asyncio.to_thread(paperclip_report, issue_id, workflow_id, wake)
 
 
 @app.post("/paperclip/heartbeat", status_code=202)
-async def paperclip_heartbeat(wake: PaperclipWake, background: BackgroundTasks, authorization: str = Header(default="")) -> dict:
+async def paperclip_heartbeat(wake: PaperclipWake, authorization: str = Header(default="")) -> dict:
     secret = os.environ.get("PAPERCLIP_WEBHOOK_SECRET", "")
     if not (secret and os.environ.get("PAPERCLIP_API_URL") and os.environ.get("PAPERCLIP_API_KEY")):
         raise HTTPException(503, "Set PAPERCLIP_WEBHOOK_SECRET, PAPERCLIP_API_URL and PAPERCLIP_API_KEY in trainer/.env.")
     if not hmac.compare_digest(authorization.encode(), ("Bearer " + secret).encode()):
         raise HTTPException(401, "Wrong Paperclip webhook secret.")
-    background.add_task(handle_paperclip_wake, wake)
+    try:
+        await handle_paperclip_wake(wake)
+    except OSError as error:  # A non-2xx answer marks the Paperclip run failed; Paperclip keeps no body, so log it here.
+        print(f"Paperclip wake {wake.runId} failed: {error}", file=sys.stderr)
+        raise HTTPException(502, f"Paperclip API call failed: {error}") from error
     return {"accepted": True}
 
 
