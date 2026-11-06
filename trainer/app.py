@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import urllib.request
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -18,7 +21,7 @@ import truststore
 # Trust the OS certificate store so downloads work behind TLS-inspecting proxies and antivirus.
 truststore.inject_into_ssl()
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -938,6 +941,104 @@ async def resume_workflow(workflow_id: str, request: WorkflowResumeRequest) -> d
     write_workflow(record)
     active_workflows[workflow_id] = asyncio.create_task(execute_workflow(workflow_id, request.response))
     return public_workflow(record)
+
+
+# Paperclip (https://github.com/paperclipai/paperclip) "http" adapter: an issue assigned to the forge-tune
+# agent starts a workflow from the JSON request in its description; the result goes back as a comment.
+PAPERCLIP_STATUS = {"complete": "done", "failed": "blocked", "interrupted": "blocked", "waiting": "blocked"}
+paperclip_starting: set[str] = set()
+
+
+class PaperclipWake(BaseModel):
+    runId: str
+    agentId: str = ""
+    context: dict = Field(default_factory=dict)
+
+
+def paperclip_call(method: str, path: str, run_id: str, body: dict | None = None) -> dict:
+    request = urllib.request.Request(os.environ["PAPERCLIP_API_URL"].rstrip("/") + path, method=method,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": "Bearer " + os.environ["PAPERCLIP_API_KEY"], "X-Paperclip-Run-Id": run_id, "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read() or b"{}")
+
+
+def paperclip_issues() -> dict:
+    try:
+        return json.loads((DATA_ROOT / "paperclip-issues.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_paperclip_issue(issue_id: str, entry: dict) -> None:
+    (DATA_ROOT / "paperclip-issues.json").write_text(json.dumps({**paperclip_issues(), issue_id: entry}, indent=2), encoding="utf-8")
+
+
+def paperclip_workflow_request(issue: dict) -> WorkflowRequest:
+    text = issue.get("description") or ""
+    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    return WorkflowRequest.model_validate_json(match.group(1) if match else text)
+
+
+def paperclip_report(issue_id: str, entry: dict) -> None:
+    """Posts a finished (or paused) workflow back once per status."""
+    record = read_workflow(entry["workflowId"])
+    status = record.get("status")
+    if status not in PAPERCLIP_STATUS or entry.get("reported") == status:
+        return
+    winner = (record.get("state", {}).get("comparison") or {}).get("winner")
+    lines = [f"forge-tune workflow `{record['id']}` finished as **{status}**."]
+    if winner:
+        lines.append(f"Winning model: `{winner}`. Adapter: `GET /workflow/runs/{record['id']}/export` on the trainer.")
+    if record.get("error"):
+        lines.append("Error: " + record["error"])
+    if record.get("pendingAction"):
+        lines.append("Waiting for review in forge-tune: " + str(record["pendingAction"].get("message", "")))
+    paperclip_call("PATCH", f"/api/issues/{issue_id}", entry["runId"], {"status": PAPERCLIP_STATUS[status], "comment": "\n\n".join(lines)})
+    save_paperclip_issue(issue_id, {**entry, "reported": status})
+
+
+async def handle_paperclip_wake(wake: PaperclipWake) -> None:
+    issue_id = wake.context.get("taskId")
+    if not issue_id or issue_id in paperclip_starting:
+        return
+    entry = paperclip_issues().get(issue_id)
+    try:
+        if entry is None:
+            paperclip_starting.add(issue_id)
+            issue = await asyncio.to_thread(paperclip_call, "GET", f"/api/issues/{issue_id}", wake.runId)
+            try:
+                record = await create_workflow(paperclip_workflow_request(issue))
+            except (ValueError, HTTPException) as error:
+                detail = str(getattr(error, "detail", "") or error)[:1500]
+                await asyncio.to_thread(paperclip_call, "PATCH", f"/api/issues/{issue_id}", wake.runId, {"status": "blocked",
+                    "comment": "Put a forge-tune workflow request (the `POST /workflow/runs` JSON body) in the issue description.\n\n" + detail})
+                return
+            entry = {"workflowId": record["id"], "runId": wake.runId, "reported": None}
+            save_paperclip_issue(issue_id, entry)
+            await asyncio.to_thread(paperclip_call, "PATCH", f"/api/issues/{issue_id}", wake.runId,
+                {"status": "in_progress", "comment": f"Started forge-tune workflow `{record['id']}`."})
+        else:
+            entry = {**entry, "runId": wake.runId}
+        # ponytail: a run resumed in the forge-tune UI after a restart or review is reported on the issue's next wake.
+        if task := active_workflows.get(entry["workflowId"]):
+            await asyncio.wait({task})
+        await asyncio.to_thread(paperclip_report, issue_id, entry)
+    except Exception as error:
+        print(f"Paperclip wake for issue {issue_id} failed: {error}", file=sys.stderr)
+    finally:
+        paperclip_starting.discard(issue_id)
+
+
+@app.post("/paperclip/heartbeat", status_code=202)
+async def paperclip_heartbeat(wake: PaperclipWake, background: BackgroundTasks, authorization: str = Header(default="")) -> dict:
+    secret = os.environ.get("PAPERCLIP_WEBHOOK_SECRET", "")
+    if not (secret and os.environ.get("PAPERCLIP_API_URL") and os.environ.get("PAPERCLIP_API_KEY")):
+        raise HTTPException(503, "Set PAPERCLIP_WEBHOOK_SECRET, PAPERCLIP_API_URL and PAPERCLIP_API_KEY in trainer/.env.")
+    if not hmac.compare_digest(authorization.encode(), ("Bearer " + secret).encode()):
+        raise HTTPException(401, "Wrong Paperclip webhook secret.")
+    background.add_task(handle_paperclip_wake, wake)
+    return {"accepted": True}
 
 
 @app.get("/runs")
