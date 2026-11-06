@@ -394,6 +394,7 @@ def _default_hyperparameters(profile: dict[str, Any]) -> dict[str, Any]:
         "batch_size": 1,
         "gradient_accumulation": 8,
         "max_sequence_length": min(4096, max(1024, p95 * 2)),
+        "train_on_reasoning": False,
     }
 
 
@@ -930,6 +931,12 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
             if len(results)>MAX_LOCAL+MAX_COMPASS: raise ValueError(f"This pilot compares at most {MAX_LOCAL+MAX_COMPASS} models.")
             results,prices=apply_review(results,response,benchmark.get("prices",{}))
             summary=select_model(results,benchmark["developmentIds"])
+            chosen=response.get("model")
+            if chosen and summary.get("winner"):
+                # A person may fine-tune another local model than the best one, e.g. a smaller model that trains on longer examples.
+                if not any(r["modelId"]==chosen and r.get("provider")=="local" and r.get("status")=="complete" for r in results):
+                    raise ValueError("Choose a model on your VM that completed the benchmark.")
+                summary.update(winner=chosen,reason=f"You chose {chosen} to fine-tune. "+summary["reason"])
             summary["accuracyReview"] = accuracy_agent_review(results)
             return {"model_benchmark":{**benchmark,**summary,"prices":prices,"error":None},"status":"awaiting_model_selection"}
         except (ValueError,TypeError,KeyError) as error:
