@@ -10,8 +10,17 @@ from pathlib import Path
 from advisor import classification_label_field, classification_prediction, classification_report, detect_schema, input_key, normalize_columns
 
 
+def final_solution(answer: str) -> str:
+    """A reasoning model's answer without its <think> section: the worked solution written after </think>."""
+    _, closed, after = answer.rpartition("</think>")
+    return after.strip() if closed and after.strip() else answer
+
+
 def training_text_dataset(dataset, tokenizer, max_length=None):
-    """Tokenize once and supply explicit, validated completion masks to TRL."""
+    """Tokenize once and supply explicit, validated completion masks to TRL.
+
+    Targets are trained without their <think> reasoning (models trained here answer directly), and examples longer
+    than max_length are skipped rather than cut, since a cut example teaches the model to stop before its answer."""
     def format_example(example):
         prompt = ""
         if "messages" in example:
@@ -19,6 +28,7 @@ def training_text_dataset(dataset, tokenizer, max_length=None):
             if not messages or messages[-1].get("role") != "assistant" or not str(messages[-1].get("content", "")).strip():
                 raise ValueError("Chat training requires a nonempty final assistant target.")
             # ponytail: supervise the final assistant turn; expand conversations into turns if all-turn training is needed.
+            messages = [*messages[:-1], {**messages[-1], "content": final_solution(str(messages[-1]["content"]))}]
             prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
             text = tokenizer.apply_chat_template(messages, tokenize=False)
             if not text.startswith(prompt):
@@ -27,7 +37,7 @@ def training_text_dataset(dataset, tokenizer, max_length=None):
             prompt = str(example["prompt"])
             if not str(example["completion"]).strip():
                 raise ValueError("Completion target is empty.")
-            text = prompt + str(example["completion"])
+            text = prompt + final_solution(str(example["completion"]))
         elif "text" in example:
             label_field = classification_label_field(list(example))
             if label_field:
@@ -47,13 +57,14 @@ def training_text_dataset(dataset, tokenizer, max_length=None):
             ids.append(tokenizer.eos_token_id)
         count = len(ids)
         mask = [0] * len(prefix) + [1] * (count - len(prefix))
-        if max_length:
-            ids, mask = ids[:max_length], mask[:max_length]
-        if not any(mask[1:]):
-            raise ValueError("Truncation removed all response target tokens; increase sequence length or shorten the prompt.")
         return {"input_ids": ids, "completion_mask": mask, "token_count": count}
 
-    return dataset.map(format_example, remove_columns=dataset.column_names)
+    formatted = dataset.map(format_example, remove_columns=dataset.column_names)
+    if max_length:
+        formatted = formatted.filter(lambda row: row["token_count"] <= max_length)
+        if not len(formatted):
+            raise ValueError(f"No example fits the {max_length}-token training window, so no complete response target remains; increase the window or shorten the data.")
+    return formatted
 
 
 def manifest_training_split(dataset, manifest):
@@ -157,7 +168,7 @@ def main() -> None:
     formatted = {key: training_text_dataset(value, tokenizer, hp["max_sequence_length"]) for key, value in split.items()}
     lengths = list(formatted["train"]["token_count"])
     formatted = {key: value.remove_columns("token_count") for key, value in formatted.items()}
-    context = {"rows":len(lengths), "maxTokens":max(lengths), "truncatedRows":sum(n > hp["max_sequence_length"] for n in lengths), "retainedTokenFraction":sum(min(n,hp["max_sequence_length"]) for n in lengths)/max(1,sum(lengths))}
+    context = {"rows":len(lengths), "skippedRows":len(split["train"]) - len(lengths), "window":hp["max_sequence_length"], "maxTokens":max(lengths), "truncatedRows":0, "retainedTokenFraction":1.0}
     (run_dir / "training-context.json").write_text(json.dumps(context, indent=2), encoding="utf-8")
     print("Training context: " + json.dumps(context), flush=True)
     trainer = SFTTrainer(
@@ -171,7 +182,7 @@ def main() -> None:
     print(f"Trainable adapter parameters: {trainable_count}", flush=True)
     trained = trainer.train()
     metrics = trainer.evaluate()
-    metrics.update({"trainingContext": context, "validationSplit": "development" if manifest_path else "validation", "train_loss": trained.training_loss, "optimizerSteps": trained.global_step, "trainRows": len(split["train"]), "evalRows": len(split["test"]), "maxSequenceLength": hp["max_sequence_length"], "trainableParameters": sum(p.numel() for p in model.parameters() if p.requires_grad)})
+    metrics.update({"trainingContext": context, "validationSplit": "development" if manifest_path else "validation", "train_loss": trained.training_loss, "optimizerSteps": trained.global_step, "trainRows": len(formatted["train"]), "evalRows": len(formatted["test"]), "maxSequenceLength": hp["max_sequence_length"], "trainableParameters": sum(p.numel() for p in model.parameters() if p.requires_grad)})
     label_field = classification_label_field(list(split["test"].column_names))
     if detect_schema(list(split["test"].column_names)) == "classification" and label_field:
         labels = sorted({str(value).strip() for part in split.values() for value in part[label_field] if str(value).strip()})
