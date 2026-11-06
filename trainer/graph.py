@@ -30,6 +30,7 @@ from advisor import (
     baseline_compare,
     cloud_assess_blockers,
     cloud_clarify,
+    draft_task_brief,
     evaluate_tuned_run,
     evaluation_messages,
     load_source,
@@ -69,6 +70,7 @@ class WorkflowState(TypedDict, total=False):
     test_dataset: dict[str, Any] | None
     goal: Literal["speed", "balanced", "quality"]
     cloud_assist: bool
+    task_draft: dict[str, Any]
     split_seed: int
     max_candidates: int
     max_retries: int
@@ -747,13 +749,27 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
             if isinstance(response, dict) and response.get("action") == "continue_training":
                 return {"analysis_only": False, "auto_analysis": True, "status": "planning", "pending_action": None}
 
+    async def draft_task(state: WorkflowState) -> dict[str, Any]:
+        # Runs once before the task form: LangGraph reruns an interrupted node on every resume, so the cloud is asked only here.
+        if "task_description" not in state or state.get("task_draft") or all(str(state.get(key) or "").strip() for key in ("task_description", "success_metric")):
+            return {}
+        cloud = bool(state.get("cloud_assist"))
+        if cloud:
+            report_progress(state, "Drafting the task description")
+        try:
+            draft = await asyncio.to_thread(draft_task_brief, state.get("profile", {}), cloud)
+        finally:
+            if cloud:
+                clear_progress(state)
+        return {"task_draft": draft}
+
     async def build_candidates(state: WorkflowState) -> dict[str, Any]:
         # Persisted workflows predating task briefs retain their existing decisions.
         brief = {key: state.get(key, "") for key in ("task_description", "success_metric")}
         limit = state.get("analysis_limit", 50)
         pick = state.get("ai_model_pick", True)
         while "task_description" in state and not all(isinstance(v, str) and 1 <= len(v.strip()) <= 2000 for v in brief.values()):
-            response = interrupt({"type": "task_review", "message": "Define the intended task and how success will be measured before comparing models.", "analysisLimit": limit})
+            response = interrupt({"type": "task_review", "message": "Define the intended task and how success will be measured before comparing models.", "analysisLimit": limit, "draft": state.get("task_draft")})
             if not isinstance(response, dict):
                 continue
             if response.get("action") == "abort":
@@ -1316,6 +1332,7 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
         "assess_retry": assess_retry,
         "advance_candidate": advance_candidate,
         "compare_final": compare_final,
+        "draft_task": draft_task,
         "finish_blocked": finish,
         "finish_cancelled": finish,
         "finish_failed": finish,
@@ -1327,16 +1344,17 @@ def build_workflow_graph(services: WorkflowServices, checkpointer: Any) -> Any:
     builder.add_edge("initialize", "load_and_normalize")
     builder.add_edge("load_and_normalize", "profile_and_split")
     builder.add_edge("profile_and_split", "privacy_scanner")
-    builder.add_conditional_edges("privacy_scanner", route_after_profile, {"assess_blockers": "assess_blockers", "human_data_review": "human_data_review", "clarify_data": "clarify_data", "build_candidates": "build_candidates", "dataset_ready": "dataset_ready"})
+    builder.add_conditional_edges("privacy_scanner", route_after_profile, {"assess_blockers": "assess_blockers", "human_data_review": "human_data_review", "clarify_data": "clarify_data", "build_candidates": "draft_task", "dataset_ready": "dataset_ready"})
     builder.add_edge("assess_blockers", "blocker_resolution_review")
     builder.add_conditional_edges("blocker_resolution_review", route_after_blocker_review, {"load_and_normalize": "load_and_normalize", "apply_blocker_remediation": "apply_blocker_remediation", "finish_blocked": "finish_blocked"})
     builder.add_edge("apply_blocker_remediation", "load_and_normalize")
-    builder.add_conditional_edges("human_data_review", route_after_data_review, {"load_and_normalize": "load_and_normalize", "build_candidates": "build_candidates", "dataset_ready": "dataset_ready", "finish_blocked": "finish_blocked"})
-    builder.add_conditional_edges("clarify_data", route_after_clarification, {"human_data_review": "human_data_review", "build_candidates": "build_candidates"})
+    builder.add_conditional_edges("human_data_review", route_after_data_review, {"load_and_normalize": "load_and_normalize", "build_candidates": "draft_task", "dataset_ready": "dataset_ready", "finish_blocked": "finish_blocked"})
+    builder.add_conditional_edges("clarify_data", route_after_clarification, {"human_data_review": "human_data_review", "build_candidates": "draft_task"})
     builder.add_conditional_edges("build_candidates", lambda state: "finish_blocked" if not state.get("candidates") else "pick_models" if state.get("benchmark_selection") else "baseline_evaluate", {"finish_blocked": "finish_blocked", "pick_models": "pick_models", "baseline_evaluate": "baseline_evaluate"})
     builder.add_edge("pick_models", "approve_models")
     builder.add_conditional_edges("approve_models", lambda state: "finish_cancelled" if state.get("status") == "cancelled" else "benchmark_models", {"finish_cancelled": "finish_cancelled", "benchmark_models": "benchmark_models"})
-    builder.add_conditional_edges("dataset_ready", lambda state: "finish_cancelled" if state.get("status") == "cancelled" else "build_candidates", {"finish_cancelled": "finish_cancelled", "build_candidates": "build_candidates"})
+    builder.add_conditional_edges("dataset_ready", lambda state: "finish_cancelled" if state.get("status") == "cancelled" else "build_candidates", {"finish_cancelled": "finish_cancelled", "build_candidates": "draft_task"})
+    builder.add_edge("draft_task", "build_candidates")
     builder.add_conditional_edges("benchmark_models",lambda state: "finish_blocked" if state.get("status")=="blocked" else "model_selection")
     builder.add_conditional_edges("model_selection",lambda state: END if state.get("status") in {"complete","cancelled"} else "baseline_evaluate" if state.get("status")=="baseline" else "model_selection")
     builder.add_edge("baseline_evaluate", "accuracy_reviewer")
