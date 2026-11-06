@@ -34,16 +34,18 @@ CODE = re.compile(r"```(?:python|javascript|typescript|java|cpp|sql|bash)\b|^\s*
 def normalize_columns(dataset: Dataset) -> Dataset:
     """Map Alpaca-style instruction/input/output rows to prompt/completion.
 
+    Some datasets (e.g. Bitext customer support) name the answer `response`.
     Their `text` column repeats the whole example, answer included, so it is
     dropped rather than used as model input.
     """
     columns = set(dataset.column_names)
-    if not {"instruction", "output"} <= columns or columns & {"prompt", "completion", "messages"}:
+    answer = "output" if "output" in columns else "response"
+    if not {"instruction", answer} <= columns or columns & {"prompt", "completion", "messages"}:
         return dataset
     def pair(row):
         extra = str(row.get("input") or "").strip()
-        return {"prompt": str(row["instruction"]) + ("\n\n" + extra if extra else ""), "completion": str(row["output"])}
-    return dataset.map(pair, remove_columns=[name for name in ("instruction", "input", "output", "text") if name in columns])
+        return {"prompt": str(row["instruction"]) + ("\n\n" + extra if extra else ""), "completion": str(row[answer])}
+    return dataset.map(pair, remove_columns=[name for name in ("instruction", "input", answer, "text") if name in columns])
 
 
 def load_source(source: str, name: str, extension: str | None = None) -> Dataset:
