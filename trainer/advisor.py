@@ -24,6 +24,18 @@ MODELS = [
     {"id": "mistralai/Mistral-7B-Instruct-v0.3", "name": "Mistral", "sizeB": 7, "vram": 13, "license": "Apache 2.0", "task": "english-writing"},
     {"id": "Qwen/Qwen2.5-14B-Instruct", "name": "Qwen 2.5", "sizeB": 14, "vram": 22, "license": "Apache 2.0", "task": "general"},
 ]
+# FORGETUNE_CPU_TRAINING=1 swaps the catalog for one tiny model that trains without a GPU (slowly, at full precision),
+# so the whole workflow can be tested on a laptop. Its answers are not worth shipping.
+CPU_MODELS = [{"id": "Qwen/Qwen2.5-0.5B-Instruct", "name": "Qwen 2.5", "sizeB": 0.5, "vram": 0, "license": "Apache 2.0", "task": "general"}]
+
+
+def cpu_training() -> bool:
+    # Read on every call: app.py loads trainer/.env after importing this module.
+    return os.environ.get("FORGETUNE_CPU_TRAINING") == "1"
+
+
+def catalog() -> list[dict[str, Any]]:
+    return CPU_MODELS if cpu_training() else MODELS
 EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE = re.compile(r"(?<!\w)(?:\+?\d[\d ()-]{7,}\d)(?!\w)")
 SECRET = re.compile(r"\b(?:sk|api|key|token|secret)[_-]?[A-Za-z0-9_-]{12,}\b", re.I)
@@ -292,8 +304,9 @@ def local_profile(dataset: Dataset) -> dict[str, Any]:
 def rank_candidates(profile: dict[str, Any], goal: str, memory_gb: int = 24) -> list[dict[str, Any]]:
     task = profile["classification"]["task"]
     candidates = []
-    for model in MODELS:
-        method = "qlora" if model["sizeB"] >= 7 else ("lora" if goal == "quality" else "qlora")
+    cpu = cpu_training()
+    for model in catalog():
+        method = "lora" if cpu else "qlora" if model["sizeB"] >= 7 else ("lora" if goal == "quality" else "qlora")
         reason, rejected = [], None
         if model["vram"] > memory_gb:
             rejected = "Estimated VRAM exceeds available GPU memory."
@@ -517,6 +530,15 @@ def _plan_batches(lengths: list[int], kv_bytes: float, free_bytes: float) -> lis
     return batches
 
 
+def model_load_options(method: str, torch: Any) -> dict[str, Any]:
+    """from_pretrained options: float16 (4-bit for QLoRA) on CUDA; full precision on the CPU, where neither works."""
+    if not torch.cuda.is_available():
+        return {"torch_dtype": torch.float32}
+    from transformers import BitsAndBytesConfig
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
+    return {"quantization_config": quant, "torch_dtype": torch.float16}
+
+
 def _free_gpu_bytes(torch: Any) -> float:
     try:
         return float(sum(torch.cuda.mem_get_info(device)[0] for device in range(torch.cuda.device_count())))
@@ -558,7 +580,7 @@ def baseline_compare(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Run small local base-model comparisons. This intentionally loads one model at a time."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     import torch
 
     selected_indices = list(eval_indices)[:limit] if eval_indices is not None else list(range(len(dataset)))[:limit]
@@ -575,8 +597,7 @@ def baseline_compare(
             # Batched generation must continue each prompt from its own last token.
             tokenizer.padding_side = "left"
             # Load as training does (train.py): T4s compute far faster in float16 than in the float32 default.
-            quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if candidate["method"] == "qlora" else None
-            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map="auto", torch_dtype=torch.float16)
+            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], device_map="auto", **model_load_options(candidate["method"], torch))
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
             references, predictions = [], []
@@ -636,7 +657,7 @@ def evaluate_tuned_run(
 ) -> dict[str, Any]:
     """Evaluate a saved adapter on the same deterministic examples as its baseline."""
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     import torch
 
     model_id = candidate["model"]["id"]
@@ -645,10 +666,9 @@ def evaluate_tuned_run(
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     # Same precision and batched, unlimited generation as the baseline comparison, so base and tuned answers are compared fairly.
-    quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
     base = model = inputs = loss_output = output = None
     try:
-        base = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map="auto", torch_dtype=torch.float16)
+        base = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", **model_load_options(method, torch))
         model = PeftModel.from_pretrained(base, str(run_dir / "adapter"))
         rows_dataset = test_dataset if test_dataset is not None else dataset
         rows = rows_dataset.select(list(eval_indices))

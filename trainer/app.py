@@ -27,7 +27,7 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from advisor import baseline_compare, cloud_clarify, cloud_status, connection_test, load_source, local_profile, rank_candidates
+from advisor import baseline_compare, cloud_clarify, cloud_status, connection_test, cpu_training, load_source, local_profile, rank_candidates
 from graph import WorkflowServices, build_workflow_graph, isolated_inference, accuracy_agent_review, _compare_results
 from evaluator import DEFAULT_MODEL, evaluate_results
 import compass_client
@@ -150,9 +150,9 @@ class ExperimentRequest(BaseModel):
 
 @app.post("/experiments")
 async def run_experiment(request: ExperimentRequest) -> dict:
-    from advisor import MODELS
+    from advisor import catalog
     from datasets import Dataset
-    model = next((item for item in MODELS if item["id"] == request.model_id), None)
+    model = next((item for item in catalog() if item["id"] == request.model_id), None)
     if model is None:
         raise HTTPException(422, "Choose a model from the catalog.")
     if not request.use_case.strip() or not request.success_criteria.strip() or any(not item.prompt.strip() or not item.completion.strip() for item in request.examples):
@@ -207,7 +207,7 @@ def gpu_status() -> dict:
         memory_gb = round(float(memory.split()[0]) / 1024)
         return {"name": name, "memoryGb": memory_gb, "trainerOnline": True}
     except (FileNotFoundError, subprocess.SubprocessError, ValueError, IndexError):
-        return {"name": "NVIDIA GPU unavailable", "memoryGb": 0, "trainerOnline": True}
+        return {"name": "CPU training (test mode)" if cpu_training() else "NVIDIA GPU unavailable", "memoryGb": 0, "trainerOnline": True}
 
 
 @app.get("/hardware")
