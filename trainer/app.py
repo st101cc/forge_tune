@@ -75,7 +75,10 @@ class Hyperparameters(BaseModel):
     epochs: int = Field(default=3, ge=1, le=10)
     batch_size: int = Field(default=1, ge=1, le=16)
     gradient_accumulation: int = Field(default=8, ge=1, le=128)
-    max_sequence_length: int = Field(default=2048, ge=128, le=8192)
+    # With the chunked training loss, a real 3B QLoRA run at 12,288 tokens peaked at 11.3 GiB on a 15 GB T4.
+    max_sequence_length: int = Field(default=2048, ge=128, le=12288)
+    # Keep <think> reasoning in training targets instead of training only the solution after it.
+    train_on_reasoning: bool = False
 
 
 class RunRequest(BaseModel):
