@@ -438,111 +438,181 @@ def _looping(tokens: list[int]) -> bool:
     return _repeating(tokens) or _rewriting(tokens)
 
 
-def _stop_repeating(prompt_length: int, torch: Any, ends: set[int]) -> Any:
-    """Greedy decoding can loop without ending: stop exact repeats (checked every 32 tokens) and answers that keep
-    rewriting themselves (every 256 tokens, the costlier check); every other answer runs until the model ends it."""
-    from transformers import StoppingCriteria
-
-    class StopRepeating(StoppingCriteria):
-        def __call__(self, input_ids, scores, **kwargs):
-            done = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-            generated = input_ids.shape[1] - prompt_length
-            if generated % 32 == 0:
-                tails = input_ids[:, max(prompt_length, input_ids.shape[1] - 3 * LOOP_TOKENS):].tolist()
-                for row, tokens in enumerate(tails):
-                    done[row] = _repeating(tokens)
-            if generated % 256 == 0 and generated >= REWRITE_WINDOW + PHRASE_TOKENS:
-                for row, tokens in enumerate(input_ids[:, prompt_length:].tolist()):
-                    if not done[row] and tokens[-1] not in ends:  # An ended answer is only padding now.
-                        done[row] = _rewriting(tokens)
-            return done
-
-    return StopRepeating()
-
-
-def _generate_batch(model: Any, tokenizer: Any, prompts: list[str], torch: Any, max_new_tokens: int | None = None) -> list[dict[str, Any]]:
-    """Greedy answers for several prompts in one generate call: decoding is memory-bound, so a batch costs about one answer's time.
-
-    Without max_new_tokens an answer runs until the model ends it, its context is full, or it loops."""
-    ends = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
-    ends = {tokenizer.eos_token_id, *(ends if isinstance(ends, list) else [ends] if ends is not None else [])}
-    output = None
-    try:
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(model.device)
-        prompt_length = inputs["input_ids"].shape[1]
-        context = getattr(getattr(model, "config", None), "max_position_embeddings", None) or 32768
-        with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=max_new_tokens or context - prompt_length, do_sample=False, pad_token_id=tokenizer.eos_token_id,
-                                    stopping_criteria=[_stop_repeating(prompt_length, torch, ends)])
-    except torch.cuda.OutOfMemoryError:
-        if len(prompts) == 1:
-            raise
-    if output is None:
-        # Split outside the except block so the failed attempt's tensors can be freed first.
-        inputs = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        half = len(prompts) // 2
-        return _generate_batch(model, tokenizer, prompts[:half], torch, max_new_tokens) + _generate_batch(model, tokenizer, prompts[half:], torch, max_new_tokens)
-    answers = []
-    for row in output:
-        new = [int(token) for token in row[prompt_length:]]
-        ended = next((i for i, token in enumerate(new) if token in ends), None)
-        if ended is not None:
-            new = new[:ended]  # Answers that end early are padded to the batch's length.
-        # An answer the loop check stopped is padded the same way, so it is told apart by its loop, not its ending.
-        looping = _looping(new)
-        answers.append({"text": tokenizer.decode(new, skip_special_tokens=True), "hitTokenLimit": ended is None and not looping, "stoppedRepeating": looping})
-    return answers
-
-
-# Measured on the VM's two T4s with 4-bit Qwen2.5-7B and Mistral-7B: 8, 16 and 32 answers at once gave about
+# Measured on the VM's T4s with 4-bit Qwen2.5-7B and Mistral-7B: 8, 16 and 32 answers at once gave about
 # 65, 100 and 135 tokens/s; 48 ran out of memory even with 330-token prompts.
-MAX_ANSWER_BATCH = 32
-BATCH_INPUT_TOKENS = 10_000  # 32 prompts of ~330 tokens fitted, 48 did not.
-# Answers have no length cap; this is only the growth each answer's KV cache is planned for when sizing a batch.
+ANSWER_SLOTS = 32
+# Answers have no length cap; this is only the growth each answer's KV cache is planned for when it joins.
 ANSWER_ROOM = 4096
 
 
-def _plan_batches(lengths: list[int], kv_bytes: float, free_bytes: float) -> list[list[int]]:
-    """Group prompts of similar length into batches that fit the GPU; returns prompt positions per batch."""
-    batches: list[list[int]] = []
-    for position in sorted(range(len(lengths)), key=lengths.__getitem__):
-        size, longest = len(batches[-1]) + 1 if batches else 1, lengths[position]  # Sorted, so the newest is the longest.
-        fits = batches and size <= MAX_ANSWER_BATCH and size * longest <= BATCH_INPUT_TOKENS and size * (longest + ANSWER_ROOM) * kv_bytes <= 0.8 * free_bytes
-        if fits:
-            batches[-1].append(position)
-        else:
-            batches.append([position])
-    return batches
-
-
-def _free_gpu_bytes(torch: Any) -> float:
-    try:
-        return float(sum(torch.cuda.mem_get_info(device)[0] for device in range(torch.cuda.device_count())))
-    except (AttributeError, RuntimeError):
-        return float("inf")  # No CUDA to measure; only the batch and input limits apply.
-
-
-def _answer_all(model: Any, tokenizer: Any, prompts: list[str], lengths: list[int], torch: Any, max_new_tokens: int | None = None,
-                on_batch: Callable[[int], None] | None = None) -> tuple[list[dict[str, Any]], list[float]]:
-    """Answers every prompt in GPU-sized batches; returns the answers and each one's share of its batch's time, in prompt order."""
+def _kv_bytes(model: Any) -> int:
+    """float16 key and value bytes one token adds to the cache."""
     config = getattr(model, "config", None)
     heads = getattr(config, "num_attention_heads", None)
     head_dim = getattr(config, "head_dim", None) or (getattr(config, "hidden_size", 0) // heads if heads else 0)
-    kv_bytes = 2 * getattr(config, "num_hidden_layers", 0) * getattr(config, "num_key_value_heads", heads or 0) * head_dim * 2
-    answers: list[Any] = [None] * len(prompts)
-    seconds = [0.0] * len(prompts)
-    done = 0
-    for batch in _plan_batches([min(length, 4096) for length in lengths], kv_bytes, _free_gpu_bytes(torch)):
-        started = time.perf_counter()
-        for position, answer in zip(batch, _generate_batch(model, tokenizer, [prompts[i] for i in batch], torch, max_new_tokens)):
-            answers[position] = answer
-            seconds[position] = (time.perf_counter() - started) / len(batch)
-        done += len(batch)
-        if on_batch:
-            on_batch(done)
-    return answers, seconds
+    return 2 * getattr(config, "num_hidden_layers", 0) * getattr(config, "num_key_value_heads", heads or 0) * head_dim * 2
+
+
+def _answer_stream(model: Any, tokenizer: Any, prompts: list[str], pending: Any, lock: Any, answers: list[Any], torch: Any,
+                   max_new_tokens: int | None = None, on_answer: Callable[[], None] | None = None) -> None:
+    """Greedy answers that join and leave one running batch: when an answer ends, the next question takes its slot.
+
+    A batch that waits for its longest answer spends most of its time decoding one or two answers while the rest are
+    finished; here the GPU keeps answering up to ANSWER_SLOTS questions at once until the queue is empty. Questions are
+    taken from `pending` (shared under `lock` when several models answer), each answer is written to `answers`.
+    Without max_new_tokens an answer runs until the model ends it, its context is full, or it loops."""
+    ends = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    ends = {tokenizer.eos_token_id, *(ends if isinstance(ends, list) else [ends] if ends is not None else [])}
+    pad = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else tokenizer.eos_token_id
+    context = getattr(getattr(model, "config", None), "max_position_embeddings", None) or 32768
+    device = model.device
+    budget = 0.8 * torch.cuda.mem_get_info(device)[0] if str(device).startswith("cuda") else float("inf")
+    kv, slots = _kv_bytes(model), ANSWER_SLOTS
+    rows: list[dict[str, Any]] = []
+    cache = mask = upcoming = None
+
+    def finish(row: dict[str, Any], outcome: str | None) -> None:
+        answers[row["position"]] = {"text": tokenizer.decode(row["tokens"], skip_special_tokens=True),
+                                    "hitTokenLimit": outcome == "limit", "stoppedRepeating": outcome == "loop"}
+        with lock:
+            if on_answer:
+                on_answer()
+
+    while True:
+        joining = []
+        width = mask.shape[1] if mask is not None else 0
+        while len(rows) + len(joining) < slots:
+            with lock:
+                if not pending:
+                    break
+                ids = tokenizer(prompts[pending[0]], truncation=True, max_length=4096)["input_ids"]
+                width = max(width, len(ids))
+                if (rows or joining) and (len(rows) + len(joining) + 1) * (width + ANSWER_ROOM) * kv > budget:
+                    break  # Joins once running answers end and free their cache.
+                joining.append({"position": pending.popleft(), "ids": ids, "tokens": [], "limit": min(max_new_tokens or context, context - len(ids))})
+        if not rows and not joining:
+            return
+        out_of_memory = False
+        try:
+            with torch.no_grad():
+                if joining:
+                    longest = max(len(row["ids"]) for row in joining)
+                    ids = torch.tensor([[pad] * (longest - len(row["ids"])) + row["ids"] for row in joining], device=device)
+                    joined = torch.tensor([[0] * (longest - len(row["ids"])) + [1] * len(row["ids"]) for row in joining], device=device)
+                    # Only the last position's scores are needed; all of them (prompt x 152k-word vocabulary) ran 32 prompts out of memory.
+                    out = model(input_ids=ids, attention_mask=joined, position_ids=(joined.cumsum(-1) - 1).clamp(min=0), use_cache=True, logits_to_keep=1)
+                    first = out.logits[:, -1].argmax(-1)
+                    if cache is None:
+                        cache, mask, upcoming = out.past_key_values, joined, first
+                    else:
+                        # Left-pad the shorter side so every row's cache ends at its latest token; padding is masked out.
+                        size = max(mask.shape[1], longest)
+                        grow = lambda tensor, have: torch.nn.functional.pad(tensor, (0, 0, size - have, 0))
+                        for layer, new in zip(cache.layers, out.past_key_values.layers):
+                            layer.keys = torch.cat([grow(layer.keys, mask.shape[1]), grow(new.keys, longest)])
+                            layer.values = torch.cat([grow(layer.values, mask.shape[1]), grow(new.values, longest)])
+                        mask = torch.cat([torch.nn.functional.pad(mask, (size - mask.shape[1], 0)), torch.nn.functional.pad(joined, (size - longest, 0))])
+                        upcoming = torch.cat([upcoming, first])
+                    out = ids = joined = first = None
+                    rows += joining
+                    joining = []
+                keep = []
+                for index, (row, token) in enumerate(zip(rows, upcoming.tolist())):
+                    outcome = "ended" if token in ends else None
+                    if not outcome:
+                        row["tokens"].append(token)
+                        count = len(row["tokens"])
+                        # Exact repeats are checked every 32 tokens; the costlier rewriting check every 256.
+                        if (count % 32 == 0 and _repeating(row["tokens"][-3 * LOOP_TOKENS:])) or (count % 256 == 0 and count >= REWRITE_WINDOW + PHRASE_TOKENS and _rewriting(row["tokens"])):
+                            outcome = "loop"
+                        elif count >= row["limit"]:
+                            outcome = "limit"
+                    if outcome:
+                        finish(row, outcome)
+                    else:
+                        keep.append(index)
+                if len(keep) < len(rows):
+                    rows = [rows[index] for index in keep]
+                    if not rows:
+                        cache = mask = upcoming = None
+                        continue
+                    chosen = torch.tensor(keep, device=device)
+                    cache.batch_select_indices(chosen)
+                    mask, upcoming = mask[chosen], upcoming[chosen]
+                    cut = int(mask.any(0).int().argmax())  # Columns that are padding in every remaining row.
+                    if cut:
+                        mask = mask[:, cut:]
+                        for layer in cache.layers:
+                            layer.keys, layer.values = layer.keys[:, :, cut:], layer.values[:, :, cut:]
+                mask = torch.cat([mask, mask.new_ones(len(rows), 1)], dim=1)
+                out = model(input_ids=upcoming[:, None], attention_mask=mask, position_ids=mask.sum(-1, keepdim=True) - 1, past_key_values=cache, use_cache=True)
+                cache, upcoming, out = out.past_key_values, out.logits[:, -1].argmax(-1), None
+        except torch.cuda.OutOfMemoryError:
+            if len(rows) + len(joining) <= 1:
+                raise
+            out_of_memory = True
+        if out_of_memory:
+            # The failed step may have grown some layers' caches and not others: start the running answers again, fewer at once.
+            slots = max(1, (len(rows) + len(joining)) // 2)
+            with lock:
+                pending.extendleft(reversed([row["position"] for row in rows + joining]))
+            rows, joining, cache, mask, upcoming, out = [], [], None, None, None, None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
+def answer_models(load: Callable[[Any], Any], torch: Any) -> list[Any]:
+    """One copy of the model per GPU that holds it alone, all answering from one queue; a model too big for one GPU
+    is spread over them by device_map="auto". `load` takes a device_map."""
+    count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if count < 2:
+        return [load("auto")]
+    devices = sorted(range(count), key=lambda device: -torch.cuda.mem_get_info(device)[0])
+    models = None
+    try:
+        models = [load({"": devices[0]})]
+    except torch.cuda.OutOfMemoryError:
+        pass
+    if models is None:
+        gc.collect()
+        torch.cuda.empty_cache()
+        return [load("auto")]
+    # Each copy also needs room for its answers' cache; another user's job may hold part of a GPU.
+    footprint = models[0].get_memory_footprint()
+    models += [load({"": device}) for device in devices[1:] if torch.cuda.mem_get_info(device)[0] > 2 * footprint]
+    return models
+
+
+def _answer_all(models: list[Any], tokenizer: Any, prompts: list[str], torch: Any, max_new_tokens: int | None = None,
+                on_answer: Callable[[int], None] | None = None) -> tuple[list[dict[str, Any]], list[float]]:
+    """Answers every prompt, each model on its own thread; returns the answers in prompt order and each one's share of
+    the time (answers overlap, so per-answer time is not measured)."""
+    import threading
+    from collections import deque
+
+    # Shortest prompts first: every running answer is padded to the longest one in the batch, and on a T4 padded attention
+    # copies the cache once per query head (8x for Qwen2.5), so a 4,096-token prompt slowed 15 others from 10.7 to 2.8 steps/s.
+    order = sorted(range(len(prompts)), key=lambda i: len(tokenizer(prompts[i], truncation=True, max_length=4096)["input_ids"]))
+    pending, lock, answers, errors = deque(order), threading.Lock(), [None] * len(prompts), []
+    report = (lambda: on_answer(sum(answer is not None for answer in answers))) if on_answer else None
+
+    def work(model: Any) -> None:
+        try:
+            _answer_stream(model, tokenizer, prompts, pending, lock, answers, torch, max_new_tokens, report)
+        except Exception as error:  # Re-raised below; the other copies finish the queue.
+            errors.append(error)
+
+    started = time.perf_counter()
+    threads = [threading.Thread(target=work, args=(model,)) for model in models[1:]]
+    for thread in threads:
+        thread.start()
+    work(models[0])
+    for thread in threads:
+        thread.join()
+    if errors and any(answer is None for answer in answers):
+        raise errors[0]
+    share = (time.perf_counter() - started) / max(1, len(prompts))
+    return answers, [share] * len(prompts)
 
 
 def baseline_compare(
@@ -568,7 +638,7 @@ def baseline_compare(
         if on_progress:
             on_progress(number * len(rows), len(candidates) * len(rows))
         started = time.perf_counter()
-        model = inputs = loss_output = output = None
+        model = models = inputs = loss_output = output = None
         try:
             tokenizer = AutoTokenizer.from_pretrained(candidate["model"]["id"], use_fast=True)
             tokenizer.pad_token = tokenizer.eos_token
@@ -576,7 +646,8 @@ def baseline_compare(
             tokenizer.padding_side = "left"
             # Load as training does (train.py): T4s compute far faster in float16 than in the float32 default.
             quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if candidate["method"] == "qlora" else None
-            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map="auto", torch_dtype=torch.float16)
+            models = answer_models(lambda device_map: AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map=device_map, torch_dtype=torch.float16), torch)
+            model = models[0]
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
             references, predictions = [], []
@@ -595,7 +666,7 @@ def baseline_compare(
                         losses.append(float(loss_output.loss.item()))
             inputs = loss_output = None
             report = (lambda done, number=number: on_progress(number * len(rows) + done, len(candidates) * len(rows))) if on_progress else None
-            answers, answer_seconds = _answer_all(model, tokenizer, [item[1] for item in prepared], [item[4] for item in prepared], torch, max_new_tokens, report)
+            answers, answer_seconds = _answer_all(models, tokenizer, [item[1] for item in prepared], torch, max_new_tokens, report)
             for (index, prompt, reference, retrieved, length), answer in zip(prepared, answers):
                 generated = answer["text"]
                 references.append(reference)
@@ -617,7 +688,7 @@ def baseline_compare(
             results.append({"modelId": candidate["model"]["id"], "status": "unavailable", "message": str(error)[:300]})
         finally:
             # Release tensors and model hook cycles before freeing the CUDA allocator cache.
-            model = inputs = loss_output = output = None
+            model = models = inputs = loss_output = output = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -646,10 +717,10 @@ def evaluate_tuned_run(
     tokenizer.padding_side = "left"
     # Same precision and batched, unlimited generation as the baseline comparison, so base and tuned answers are compared fairly.
     quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
-    base = model = inputs = loss_output = output = None
+    model = models = inputs = loss_output = output = None
     try:
-        base = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map="auto", torch_dtype=torch.float16)
-        model = PeftModel.from_pretrained(base, str(run_dir / "adapter"))
+        models = answer_models(lambda device_map: PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map=device_map, torch_dtype=torch.float16), str(run_dir / "adapter")), torch)
+        model = models[0]
         rows_dataset = test_dataset if test_dataset is not None else dataset
         rows = rows_dataset.select(list(eval_indices))
         scores: list[float] = []
@@ -667,7 +738,7 @@ def evaluate_tuned_run(
                     losses.append(float(loss_output.loss.item()))
         inputs = loss_output = None
         lengths = [len(tokenizer.encode(prompt)) for prompt, _, _ in prepared]
-        answers, _ = _answer_all(model, tokenizer, [prompt for prompt, _, _ in prepared], lengths, torch)
+        answers, _ = _answer_all(models, tokenizer, [prompt for prompt, _, _ in prepared], torch)
         for position, ((prompt, reference, retrieved), answer) in enumerate(zip(prepared, answers)):
             generated = answer["text"]
             references.append(reference)
@@ -700,7 +771,7 @@ def evaluate_tuned_run(
         }
         return result
     finally:
-        base = model = inputs = loss_output = output = None
+        model = models = inputs = loss_output = output = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
