@@ -443,6 +443,20 @@ def _looping(tokens: list[int]) -> bool:
 ANSWER_SLOTS = 32
 # Answers have no length cap; this is only the growth each answer's KV cache is planned for when it joins.
 ANSWER_ROOM = 4096
+# Sampled like reasoning models are meant to be run: on 50 unseen math questions greedy decoding left Qwen2.5-3B in
+# more loops, and sampling answered 7 right instead of 5 in a third of the time. 0 means greedy.
+ANSWER_TEMPERATURE = 0.6
+ANSWER_TOP_P = 0.95
+
+
+def _pick(logits: Any, torch: Any) -> Any:
+    """Next token per row: sampled from the smallest set of tokens holding ANSWER_TOP_P of the probability."""
+    if not ANSWER_TEMPERATURE:
+        return logits.argmax(-1)
+    probs = torch.softmax(logits.float() / ANSWER_TEMPERATURE, -1)
+    ranked, order = probs.sort(-1, descending=True)
+    ranked = ranked * (ranked.cumsum(-1) - ranked < ANSWER_TOP_P)  # The most likely token always stays.
+    return order.gather(-1, torch.multinomial(ranked, 1)).squeeze(-1)
 
 
 def _kv_bytes(model: Any) -> int:
@@ -455,7 +469,7 @@ def _kv_bytes(model: Any) -> int:
 
 def _answer_stream(model: Any, tokenizer: Any, prompts: list[str], pending: Any, lock: Any, answers: list[Any], torch: Any,
                    max_new_tokens: int | None = None, on_answer: Callable[[], None] | None = None) -> None:
-    """Greedy answers that join and leave one running batch: when an answer ends, the next question takes its slot.
+    """Answers that join and leave one running batch: when an answer ends, the next question takes its slot.
 
     A batch that waits for its longest answer spends most of its time decoding one or two answers while the rest are
     finished; here the GPU keeps answering up to ANSWER_SLOTS questions at once until the queue is empty. Questions are
@@ -501,7 +515,7 @@ def _answer_stream(model: Any, tokenizer: Any, prompts: list[str], pending: Any,
                     joined = torch.tensor([[0] * (longest - len(row["ids"])) + [1] * len(row["ids"]) for row in joining], device=device)
                     # Only the last position's scores are needed; all of them (prompt x 152k-word vocabulary) ran 32 prompts out of memory.
                     out = model(input_ids=ids, attention_mask=joined, position_ids=(joined.cumsum(-1) - 1).clamp(min=0), use_cache=True, logits_to_keep=1)
-                    first = out.logits[:, -1].argmax(-1)
+                    first = _pick(out.logits[:, -1], torch)
                     if cache is None:
                         cache, mask, upcoming = out.past_key_values, joined, first
                     else:
@@ -546,7 +560,7 @@ def _answer_stream(model: Any, tokenizer: Any, prompts: list[str], pending: Any,
                             layer.keys, layer.values = layer.keys[:, :, cut:], layer.values[:, :, cut:]
                 mask = torch.cat([mask, mask.new_ones(len(rows), 1)], dim=1)
                 out = model(input_ids=upcoming[:, None], attention_mask=mask, position_ids=mask.sum(-1, keepdim=True) - 1, past_key_values=cache, use_cache=True)
-                cache, upcoming, out = out.past_key_values, out.logits[:, -1].argmax(-1), None
+                cache, upcoming, out = out.past_key_values, _pick(out.logits[:, -1], torch), None
         except torch.cuda.OutOfMemoryError:
             if len(rows) + len(joining) <= 1:
                 raise
