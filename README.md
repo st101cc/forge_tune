@@ -113,6 +113,22 @@ TRAINER_URL=http://127.0.0.1:18000 npm start
 To restart the remote API, stop its `uvicorn app:app` process first; the script exits if port 18000
 already answers. The launcher does not copy datasets or checkpoints between machines.
 
+To use [Paperclip](#configuration) running on your own machine with a remote trainer, pass its port so
+the tunnel also forwards it back to the remote machine's loopback (`-R 127.0.0.1:3100:127.0.0.1:3100`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File start-auto.ps1 -VmHost <your-ssh-alias> -PaperclipPort 3100
+```
+
+- On the remote machine, set `PAPERCLIP_API_URL=http://127.0.0.1:3100` (and the other `PAPERCLIP_*`
+  values) in `trainer/.env`, then restart the remote API.
+- In Paperclip, set the forge-tune http agent's URL to `http://127.0.0.1:18000/paperclip/heartbeat`.
+- Start Paperclip with `PAPERCLIP_HTTP_ADAPTER_PRIVATE_ENDPOINT_ALLOWLIST=http://127.0.0.1:18000`.
+
+The launcher reuses an existing tunnel on port 18000, so stop a tunnel opened without
+`-PaperclipPort` before rerunning it. On Linux or macOS, add `-R 127.0.0.1:3100:127.0.0.1:3100` to the
+`ssh` command above.
+
 ## Configuration
 
 Settings are read from environment variables, or from a `.env` file at the repository root
