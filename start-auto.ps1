@@ -1,11 +1,18 @@
-param([string]$VmHost = '', [switch]$CheckOnly, [switch]$SelfTest)
+param([string]$VmHost = '', [ValidateRange(0, 65535)][int]$PaperclipPort = 0, [switch]$CheckOnly, [switch]$SelfTest)
 $ErrorActionPreference = 'Stop'
 function Has-Local24GbGpu($MemoryMiB) {
     return @($MemoryMiB | Where-Object { $_ -and [double]$_ -ge 24000 }).Count -gt 0
 }
+function Get-TunnelForwards($PaperclipPort) {
+    $forwards = @('-L','127.0.0.1:18000:127.0.0.1:18000')
+    # Reverse forward: the trainer on the VM reaches Paperclip on this machine at its own loopback.
+    if ($PaperclipPort) { $forwards += @('-R',"127.0.0.1:${PaperclipPort}:127.0.0.1:${PaperclipPort}") }
+    return $forwards
+}
 if ($SelfTest) {
     if ((Has-Local24GbGpu @()) -or (Has-Local24GbGpu @(15360,15360)) -or -not (Has-Local24GbGpu @(24564))) { throw 'GPU selection failed' }
-    Write-Output 'GPU selection checks passed: no GPU, two T4s, nominal 24 GB GPU.'
+    if ((Get-TunnelForwards 0) -contains '-R' -or (Get-TunnelForwards 3100)[-1] -ne '127.0.0.1:3100:127.0.0.1:3100') { throw 'Tunnel forwards failed' }
+    Write-Output 'GPU selection checks passed: no GPU, two T4s, nominal 24 GB GPU. Paperclip reverse forward only when requested.'
     return
 }
 $projectPath = $PSScriptRoot
@@ -36,7 +43,7 @@ if ($localGpu) {
     & ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 $VmHost 'curl --fail --silent http://127.0.0.1:18000/hardware'
     if ($LASTEXITCODE -ne 0) { throw "Remote backend is offline. Run trainer/start-vm-backend.sh from the ForgeTune checkout on $VmHost." }
     if (-not (Get-NetTCPConnection -LocalPort 18000 -State Listen -ErrorAction SilentlyContinue)) {
-        Start-Process ssh -ArgumentList @('-N','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3','-L','127.0.0.1:18000:127.0.0.1:18000',$VmHost) -WindowStyle Hidden -RedirectStandardOutput "$logPath/tunnel.out.log" -RedirectStandardError "$logPath/tunnel.err.log" | Out-Null
+        Start-Process ssh -ArgumentList (@('-N','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3') + (Get-TunnelForwards $PaperclipPort) + @($VmHost)) -WindowStyle Hidden -RedirectStandardOutput "$logPath/tunnel.out.log" -RedirectStandardError "$logPath/tunnel.err.log" | Out-Null
     }
     $env:TRAINER_URL = 'http://127.0.0.1:18000'
 }
