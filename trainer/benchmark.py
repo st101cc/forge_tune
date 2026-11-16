@@ -30,6 +30,9 @@ def number(value):
 def select_model(results, ids):
     complete = [r for r in results if r.get("status") == "complete"]
     summary = {"winner":None,"status":"needs_review","results":results,"developmentIds":ids,"costUsed":False,"sampleWarning":"Fewer than 30 development examples: selection is exploratory, not statistically reliable." if len(ids) < 30 else None}
+    if len(results) == 1 and complete and complete[0].get("provider") == "local":
+        # Only one model ran (CPU test mode, or a GPU that fits one): nothing to compare, so it is the one to fine-tune.
+        return {**summary,"winner":complete[0]["modelId"],"status":"selected","reason":"Only one model ran, so it is the one to fine-tune; no comparison was made."}
     if len(complete) < 2:
         return {**summary,"reason":"At least two models must complete the same development questions."}
     metrics = set()

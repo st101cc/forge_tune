@@ -24,6 +24,18 @@ MODELS = [
     {"id": "mistralai/Mistral-7B-Instruct-v0.3", "name": "Mistral", "sizeB": 7, "vram": 13, "license": "Apache 2.0", "task": "english-writing"},
     {"id": "Qwen/Qwen2.5-14B-Instruct", "name": "Qwen 2.5", "sizeB": 14, "vram": 22, "license": "Apache 2.0", "task": "general"},
 ]
+# FORGETUNE_CPU_TRAINING=1 swaps the catalog for one tiny model that trains without a GPU (slowly, at full precision),
+# so the whole workflow can be tested on a laptop. Its answers are not worth shipping.
+CPU_MODELS = [{"id": "Qwen/Qwen2.5-0.5B-Instruct", "name": "Qwen 2.5", "sizeB": 0.5, "vram": 0, "license": "Apache 2.0", "task": "general"}]
+
+
+def cpu_training() -> bool:
+    # Read on every call: app.py loads trainer/.env after importing this module.
+    return os.environ.get("FORGETUNE_CPU_TRAINING") == "1"
+
+
+def catalog() -> list[dict[str, Any]]:
+    return CPU_MODELS if cpu_training() else MODELS
 EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE = re.compile(r"(?<!\w)(?:\+?\d[\d ()-]{7,}\d)(?!\w)")
 SECRET = re.compile(r"\b(?:sk|api|key|token|secret)[_-]?[A-Za-z0-9_-]{12,}\b", re.I)
@@ -39,6 +51,16 @@ def normalize_columns(dataset: Dataset) -> Dataset:
     dropped rather than used as model input.
     """
     columns = set(dataset.column_names)
+    if "messages" in columns and len(dataset) and isinstance(dataset[0]["messages"], str):
+        # Some exports store each conversation as JSON text; an unreadable row becomes empty and is reported invalid.
+        def decode(row):
+            try:
+                messages = json.loads(row["messages"])
+            except (TypeError, ValueError):
+                messages = None
+            ok = isinstance(messages, list) and all(isinstance(m, dict) and isinstance(m.get("role"), str) and isinstance(m.get("content"), str) for m in messages)
+            return {"messages": [{"role": m["role"], "content": m["content"]} for m in messages] if ok else []}
+        return dataset.map(decode)
     answer = "output" if "output" in columns else "response"
     if not {"instruction", answer} <= columns or columns & {"prompt", "completion", "messages"}:
         return dataset
@@ -292,8 +314,9 @@ def local_profile(dataset: Dataset) -> dict[str, Any]:
 def rank_candidates(profile: dict[str, Any], goal: str, memory_gb: int = 24) -> list[dict[str, Any]]:
     task = profile["classification"]["task"]
     candidates = []
-    for model in MODELS:
-        method = "qlora" if model["sizeB"] >= 7 else ("lora" if goal == "quality" else "qlora")
+    cpu = cpu_training()
+    for model in catalog():
+        method = "lora" if cpu else "qlora" if model["sizeB"] >= 7 else ("lora" if goal == "quality" else "qlora")
         reason, rejected = [], None
         if model["vram"] > memory_gb:
             rejected = "Estimated VRAM exceeds available GPU memory."
@@ -319,16 +342,28 @@ def cloud_status() -> dict[str, Any]:
     return {"configured": configured, "baseUrl": os.getenv("ADVISOR_BASE_URL", "") if configured else None, "model": os.getenv("ADVISOR_MODEL", "") if configured else None}
 
 
+def _advisor_reply(prompt: dict[str, Any]) -> str:
+    """The advisor's answer text. A model that accepts only its default temperature (e.g. gpt-6-luna) is asked again without it."""
+    endpoint = os.environ["ADVISOR_BASE_URL"].rstrip("/") + "/chat/completions"
+    headers = {"Authorization": "Bearer " + os.environ["ADVISOR_API_KEY"], "Content-Type": "application/json"}
+    body = {"model": os.environ["ADVISOR_MODEL"], "messages": [{"role": "user", "content": json.dumps(prompt)}], "temperature": 0}
+    while True:
+        request = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read())["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as error:
+            if error.code != 400 or "temperature" not in body or "temperature" not in error.read().decode("utf-8", "replace"):
+                raise
+            body.pop("temperature")
+
+
 def cloud_clarify(samples: list[dict[str, Any]], local: dict[str, Any]) -> dict[str, Any] | None:
     if not cloud_status()["configured"]:
         return None
-    endpoint = os.environ["ADVISOR_BASE_URL"].rstrip("/") + "/chat/completions"
     prompt = {"localClassification": local["classification"], "facts": local["facts"], "rows": samples[:20], "instruction": "Return JSON only with task, languageSummary, confidence, and explanation. Do not infer personal data."}
-    request = urllib.request.Request(endpoint, data=json.dumps({"model": os.environ["ADVISOR_MODEL"], "messages": [{"role": "user", "content": json.dumps(prompt)}], "temperature": 0}).encode(), headers={"Authorization": "Bearer " + os.environ["ADVISOR_API_KEY"], "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            content = json.loads(response.read())["choices"][0]["message"]["content"]
-        return json.loads(content.strip())
+        return json.loads(_advisor_reply(prompt).strip())
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
@@ -337,21 +372,55 @@ def cloud_assess_blockers(samples: list[dict[str, Any]], profile: dict[str, Any]
     """Ask the optional cloud assistant for advice only; it cannot mutate data."""
     if not cloud_status()["configured"]:
         return None
-    endpoint = os.environ["ADVISOR_BASE_URL"].rstrip("/") + "/chat/completions"
     prompt = {
         "profile": {"facts": profile.get("facts", {}), "classification": profile.get("classification", {})},
         "blockers": blockers,
         "redactedRows": samples[:20],
         "instruction": "Return JSON only: {canResolve:boolean, requiresHumanApproval:boolean, reason:string, suggestedOperations:string[]}. Give advice only. Never claim to have changed data, and never recommend bypassing a blocker.",
     }
-    request = urllib.request.Request(endpoint, data=json.dumps({"model": os.environ["ADVISOR_MODEL"], "messages": [{"role": "user", "content": json.dumps(prompt)}], "temperature": 0}).encode(), headers={"Authorization": "Bearer " + os.environ["ADVISOR_API_KEY"], "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            content = json.loads(response.read())["choices"][0]["message"]["content"]
-        result = json.loads(content.strip())
+        result = json.loads(_advisor_reply(prompt).strip())
         return result if isinstance(result, dict) else None
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
+
+
+TASK_TEMPLATES = {
+    "classification": ("Classify each text into one of the labels in the {label} column.", "Label accuracy on unseen examples; review the errors for each label."),
+    "code": ("Write code that does what each request asks.", "The code meets the request and handles edge cases, judged against the reference solution."),
+    "structured": ("Produce output in the same structured format as the reference answers.", "The output exactly matches the reference structure and values."),
+    "writing": ("Write text in the tone, structure and format of the reference answers.", "The text meets the requested tone, structure and constraints, judged against the reference."),
+    "assistant": ("Answer each user message the way the reference replies do.", "Answers are correct, complete and follow the request, judged against the reference reply."),
+}
+
+
+def draft_task_brief(profile: dict[str, Any], cloud: bool = False) -> dict[str, str]:
+    """A starting point for the task form; the user edits or replaces it before anything runs."""
+    samples = profile.get("_samples", [])
+    classification = profile.get("classification", {})
+    if any("\\boxed{" in str(sample.get("text", "")) for sample in samples):
+        # Matches how the benchmark grades these datasets: on the final \boxed{} answer.
+        description, metric = ("Solve each math problem step by step and give the final answer in \\boxed{}.",
+                               "The final \\boxed{} answer matches the reference answer; a missing or cut-off final answer counts as wrong.")
+    else:
+        description, metric = TASK_TEMPLATES.get(classification.get("task"), TASK_TEMPLATES["assistant"])
+        description = description.format(label=profile.get("facts", {}).get("labelField") or "label")
+    draft = {"task_description": description, "success_metric": metric, "source": "local"}
+    if not cloud or not cloud_status()["configured"]:
+        return draft
+    prompt = {
+        "classification": classification, "facts": profile.get("facts", {}), "draft": draft,
+        "redactedRows": [{**sample, "text": str(sample.get("text", ""))[:600]} for sample in samples[:5]],
+        "instruction": "Improve the draft for this dataset. Return JSON only: {task_description:string, success_metric:string}, one or two sentences each. "
+                       "Describe what a model trained on these rows should do and how to tell a correct answer from a wrong one. Do not quote personal data.",
+    }
+    try:
+        result = json.loads(_advisor_reply(prompt).strip().removeprefix("```json").removesuffix("```").strip())
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
+        return draft
+    if not isinstance(result, dict) or not all(isinstance(result.get(key), str) and 1 <= len(result[key].strip()) <= 2000 for key in ("task_description", "success_metric")):
+        return draft
+    return {"task_description": result["task_description"].strip(), "success_metric": result["success_metric"].strip(), "source": "cloud"}
 
 
 def connection_test() -> dict[str, Any]:
@@ -457,6 +526,17 @@ def _pick(logits: Any, torch: Any) -> Any:
     ranked, order = probs.sort(-1, descending=True)
     ranked = ranked * (ranked.cumsum(-1) - ranked < ANSWER_TOP_P)  # The most likely token always stays.
     return order.gather(-1, torch.multinomial(ranked, 1)).squeeze(-1)
+
+
+def model_load_options(method: str, torch: Any, device_map: Any = "auto") -> dict[str, Any]:
+    """from_pretrained options: float16 (4-bit for QLoRA) on CUDA; full precision on the CPU, where neither works.
+
+    No device_map on the CPU: "auto" there tries to offload weights to disk and fails."""
+    if not torch.cuda.is_available():
+        return {"torch_dtype": torch.float32}
+    from transformers import BitsAndBytesConfig
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
+    return {"quantization_config": quant, "torch_dtype": torch.float16, "device_map": device_map}
 
 
 def _kv_bytes(model: Any) -> int:
@@ -642,7 +722,7 @@ def baseline_compare(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Run small local base-model comparisons. This intentionally loads one model at a time."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     import torch
 
     selected_indices = list(eval_indices)[:limit] if eval_indices is not None else list(range(len(dataset)))[:limit]
@@ -659,8 +739,7 @@ def baseline_compare(
             # Batched generation must continue each prompt from its own last token.
             tokenizer.padding_side = "left"
             # Load as training does (train.py): T4s compute far faster in float16 than in the float32 default.
-            quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if candidate["method"] == "qlora" else None
-            models = answer_models(lambda device_map: AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], quantization_config=quant, device_map=device_map, torch_dtype=torch.float16), torch)
+            models = answer_models(lambda device_map: AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], **model_load_options(candidate["method"], torch, device_map)), torch)
             model = models[0]
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
@@ -721,7 +800,7 @@ def evaluate_tuned_run(
 ) -> dict[str, Any]:
     """Evaluate a saved adapter on the same deterministic examples as its baseline."""
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     import torch
 
     model_id = candidate["model"]["id"]
@@ -730,10 +809,9 @@ def evaluate_tuned_run(
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     # Same precision and batched, unlimited generation as the baseline comparison, so base and tuned answers are compared fairly.
-    quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
     model = models = inputs = loss_output = output = None
     try:
-        models = answer_models(lambda device_map: PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quantization, device_map=device_map, torch_dtype=torch.float16), str(run_dir / "adapter")), torch)
+        models = answer_models(lambda device_map: PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(model_id, **model_load_options(method, torch, device_map)), str(run_dir / "adapter")), torch)
         model = models[0]
         rows_dataset = test_dataset if test_dataset is not None else dataset
         rows = rows_dataset.select(list(eval_indices))

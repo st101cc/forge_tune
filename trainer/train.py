@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
-from advisor import classification_label_field, classification_prediction, classification_report, detect_schema, input_key, normalize_columns
+from advisor import cpu_training, model_load_options, classification_label_field, classification_prediction, classification_report, detect_schema, input_key, normalize_columns
 
 
 def final_solution(answer: str) -> str:
@@ -127,7 +128,7 @@ def main() -> None:
         raise ValueError("Unsupported parameter method")
 
     # Bind the training subprocess to one free GPU before CUDA initializes.
-    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    if "CUDA_VISIBLE_DEVICES" not in os.environ and shutil.which("nvidia-smi"):
         devices = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"], text=True).splitlines()
         chosen = max((line.split(",") for line in devices), key=lambda parts: int(parts[1]))
         os.environ["CUDA_VISIBLE_DEVICES"] = chosen[0].strip()
@@ -138,7 +139,7 @@ def main() -> None:
     # large ML dependencies have completed installation.
     from datasets import load_dataset
     from peft import LoraConfig, TaskType
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTTrainer, SFTConfig
     import torch
 
@@ -184,12 +185,15 @@ def main() -> None:
     except (ImportError, ModuleNotFoundError):
         tokenizer = AutoTokenizer.from_pretrained(config["base_model"], use_fast=True)
         tokenizer.pad_token = tokenizer.eos_token
-        quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
-        if not torch.cuda.is_available():
-            raise RuntimeError("Training requires a CUDA GPU.")
-        device = max(range(torch.cuda.device_count()), key=lambda i: torch.cuda.mem_get_info(i)[0])
-        torch.cuda.set_device(device)
-        base = AutoModelForCausalLM.from_pretrained(config["base_model"], quantization_config=quantization, device_map={"": device}, torch_dtype=torch.float16)
+        if torch.cuda.is_available():
+            device = max(range(torch.cuda.device_count()), key=lambda i: torch.cuda.mem_get_info(i)[0])
+            torch.cuda.set_device(device)
+            device_map = {"": device}
+        elif cpu_training():
+            device_map = None
+        else:
+            raise RuntimeError("Training requires a CUDA GPU (or FORGETUNE_CPU_TRAINING=1 for the tiny CPU test model).")
+        base = AutoModelForCausalLM.from_pretrained(config["base_model"], **model_load_options(method, torch, device_map))
         base.config.use_cache = False
         model = base
         trainer_adapter = adapter
@@ -208,7 +212,7 @@ def main() -> None:
 
     trainer = ChunkedLossSFTTrainer(
         model=model, peft_config=trainer_adapter, processing_class=tokenizer, train_dataset=formatted["train"], eval_dataset=formatted["test"],
-        args=SFTConfig(output_dir=str(output), completion_only_loss=True, prediction_loss_only=True, max_length=hp["max_sequence_length"], per_device_eval_batch_size=1, fp16=True, bf16=False, gradient_checkpointing=True, optim="adamw_torch", seed=config["split_seed"], num_train_epochs=hp["epochs"], learning_rate=hp["learning_rate"], per_device_train_batch_size=hp["batch_size"], gradient_accumulation_steps=hp["gradient_accumulation"], eval_strategy="epoch", logging_steps=1, save_strategy="epoch", report_to=[]),
+        args=SFTConfig(output_dir=str(output), completion_only_loss=True, prediction_loss_only=True, max_length=hp["max_sequence_length"], per_device_eval_batch_size=1, fp16=torch.cuda.is_available(), bf16=False, gradient_checkpointing=True, optim="adamw_torch", seed=config["split_seed"], num_train_epochs=hp["epochs"], learning_rate=hp["learning_rate"], per_device_train_batch_size=hp["batch_size"], gradient_accumulation_steps=hp["gradient_accumulation"], eval_strategy="epoch", logging_steps=1, save_strategy="epoch", report_to=[]),
     )
     model = trainer.model
     trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
