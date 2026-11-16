@@ -51,6 +51,9 @@ def request_compass(path: str, body: dict[str, Any] | None = None, *, timeout: f
                 message = json.loads(error.read()).get("message")
             except (ValueError, AttributeError, OSError):
                 message = None
+            if error.code == 400 and body and "temperature" in body and "temperature" in str(message):
+                # Some models (e.g. gpt-6-luna) accept only their default temperature.
+                return request_compass(path, {k: v for k, v in body.items() if k != "temperature"}, timeout=timeout, retries=retries)
             raise CompassError(safe_message(message or f"Compass returned HTTP {error.code}."), error.code) from None
         except Exception as error:  # Any transport or parse failure (e.g. IncompleteRead) must stay a redacted CompassError.
             raise CompassError(safe_message(error)) from None
