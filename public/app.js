@@ -419,7 +419,8 @@ function bindModelPlan(workflow) {
   const boxes = () => [...form.querySelectorAll("input[data-model]")].filter(box => box.checked);
   const sync = () => {
     const picked = boxes(), compass = picked.filter(box => box.dataset.provider === "compass").length, local = picked.length - compass;
-    const problem = picked.length < 2 ? "Choose at least 2 models." : picked.length > 7 ? "Choose at most 7 models." : local > 4 ? "Choose at most 4 of your own models." : compass > 3 ? "Choose at most 3 Compass models." : "";
+    const minimum = (workflow.pendingAction?.localOptions || []).length > 1 ? 2 : 1;
+    const problem = picked.length < minimum ? (minimum > 1 ? "Choose at least 2 models." : "Choose a model.") : picked.length > 7 ? "Choose at most 7 models." : local > 4 ? "Choose at most 4 of your own models." : compass > 3 ? "Choose at most 3 Compass models." : "";
     form.querySelector("#model-plan-limit").textContent = problem;
     form.querySelector("#approve-models").disabled = Boolean(problem);
     const privacy = form.querySelector("#model-plan-privacy");

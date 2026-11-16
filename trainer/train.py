@@ -190,10 +190,10 @@ def main() -> None:
             torch.cuda.set_device(device)
             device_map = {"": device}
         elif cpu_training():
-            device_map = None  # Stays on the CPU.
+            device_map = None
         else:
             raise RuntimeError("Training requires a CUDA GPU (or FORGETUNE_CPU_TRAINING=1 for the tiny CPU test model).")
-        base = AutoModelForCausalLM.from_pretrained(config["base_model"], device_map=device_map, **model_load_options(method, torch))
+        base = AutoModelForCausalLM.from_pretrained(config["base_model"], **model_load_options(method, torch, device_map))
         base.config.use_cache = False
         model = base
         trainer_adapter = adapter

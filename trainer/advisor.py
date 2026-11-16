@@ -51,6 +51,16 @@ def normalize_columns(dataset: Dataset) -> Dataset:
     dropped rather than used as model input.
     """
     columns = set(dataset.column_names)
+    if "messages" in columns and len(dataset) and isinstance(dataset[0]["messages"], str):
+        # Some exports store each conversation as JSON text; an unreadable row becomes empty and is reported invalid.
+        def decode(row):
+            try:
+                messages = json.loads(row["messages"])
+            except (TypeError, ValueError):
+                messages = None
+            ok = isinstance(messages, list) and all(isinstance(m, dict) and isinstance(m.get("role"), str) and isinstance(m.get("content"), str) for m in messages)
+            return {"messages": [{"role": m["role"], "content": m["content"]} for m in messages] if ok else []}
+        return dataset.map(decode)
     answer = "output" if "output" in columns else "response"
     if not {"instruction", answer} <= columns or columns & {"prompt", "completion", "messages"}:
         return dataset
@@ -572,13 +582,15 @@ def _plan_batches(lengths: list[int], kv_bytes: float, free_bytes: float) -> lis
     return batches
 
 
-def model_load_options(method: str, torch: Any) -> dict[str, Any]:
-    """from_pretrained options: float16 (4-bit for QLoRA) on CUDA; full precision on the CPU, where neither works."""
+def model_load_options(method: str, torch: Any, device_map: Any = "auto") -> dict[str, Any]:
+    """from_pretrained options: float16 (4-bit for QLoRA) on CUDA; full precision on the CPU, where neither works.
+
+    No device_map on the CPU: "auto" there tries to offload weights to disk and fails."""
     if not torch.cuda.is_available():
         return {"torch_dtype": torch.float32}
     from transformers import BitsAndBytesConfig
     quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16) if method == "qlora" else None
-    return {"quantization_config": quant, "torch_dtype": torch.float16}
+    return {"quantization_config": quant, "torch_dtype": torch.float16, "device_map": device_map}
 
 
 def _free_gpu_bytes(torch: Any) -> float:
@@ -639,7 +651,7 @@ def baseline_compare(
             # Batched generation must continue each prompt from its own last token.
             tokenizer.padding_side = "left"
             # Load as training does (train.py): T4s compute far faster in float16 than in the float32 default.
-            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], device_map="auto", **model_load_options(candidate["method"], torch))
+            model = AutoModelForCausalLM.from_pretrained(candidate["model"]["id"], **model_load_options(candidate["method"], torch))
             samples, scores, format_scores, losses = [], [], [], []
             answer_seconds = []
             references, predictions = [], []
@@ -710,7 +722,7 @@ def evaluate_tuned_run(
     # Same precision and batched, unlimited generation as the baseline comparison, so base and tuned answers are compared fairly.
     base = model = inputs = loss_output = output = None
     try:
-        base = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", **model_load_options(method, torch))
+        base = AutoModelForCausalLM.from_pretrained(model_id, **model_load_options(method, torch))
         model = PeftModel.from_pretrained(base, str(run_dir / "adapter"))
         rows_dataset = test_dataset if test_dataset is not None else dataset
         rows = rows_dataset.select(list(eval_indices))

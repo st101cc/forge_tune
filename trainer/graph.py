@@ -368,8 +368,10 @@ def _plan_error(models: Any, local: list[str], compass: list[str]) -> str | None
             return f"{str(m.get('id'))[:200]} is not an available {m.get('provider')} model."
     if len({m["id"] for m in models}) != len(models):
         return "Approve each model only once."
-    if not 2 <= len(models) <= MAX_LOCAL + MAX_COMPASS:
-        return f"Approve between 2 and {MAX_LOCAL + MAX_COMPASS} models to compare."
+    # With a single local model (CPU test mode, or a GPU that fits only one), it may run alone.
+    minimum = 2 if len(local) > 1 else 1
+    if not minimum <= len(models) <= MAX_LOCAL + MAX_COMPASS:
+        return f"Approve between {minimum} and {MAX_LOCAL + MAX_COMPASS} models to compare."
     hosted = sum(m["provider"] == "compass" for m in models)
     if len(models) - hosted > MAX_LOCAL or hosted > MAX_COMPASS:
         return f"Approve at most {MAX_LOCAL} local and {MAX_COMPASS} Compass models."
