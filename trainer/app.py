@@ -678,6 +678,7 @@ async def initialize_workflow_checkpointer() -> None:
             record.update(status="interrupted", error="Trainer restarted before this import finished. Start the import again.")
             write_import(record)
     # Nothing drives a run that was mid-step when the trainer stopped; mark it so it can be resumed from its checkpoint.
+    interrupted = set()
     for path in WORKFLOWS_ROOT.glob("*/workflow.json"):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -687,6 +688,8 @@ async def initialize_workflow_checkpointer() -> None:
             record.update(status="interrupted", pendingAction=None, error="The trainer restarted before this step finished.")
             write_workflow(record)
             (path.parent / "progress.json").unlink(missing_ok=True)
+            interrupted.add(path.parent.name)
+    paperclip_rearm(interrupted)
     if AsyncSqliteSaver is None:
         return
     try:
@@ -1012,20 +1015,31 @@ def paperclip_update(issue_id: str, wake: PaperclipWake, status: str, comment: s
 
 
 async def paperclip_wake_when_done(issue_id: str, agent_id: str, workflow_id: str) -> None:
-    # ponytail: lost on a trainer restart; a comment on the issue wakes the agent and reports the result.
     if task := active_workflows.get(workflow_id):
         await asyncio.wait({task})
     try:
-        await asyncio.to_thread(paperclip_call, "POST", f"/api/agents/{agent_id}/wakeup", "", {"source": "automation",
-            "triggerDetail": "callback", "reason": "forge-tune workflow finished", "payload": {"issueId": issue_id}})
+        # A watcher re-armed after a restart knows only the issue; wake the agent it is assigned to.
+        agent_id = agent_id or (await asyncio.to_thread(paperclip_call, "GET", f"/api/issues/{issue_id}", "")).get("assigneeAgentId")
+        if agent_id:
+            await asyncio.to_thread(paperclip_call, "POST", f"/api/agents/{agent_id}/wakeup", "", {"source": "automation",
+                "triggerDetail": "callback", "reason": "forge-tune workflow finished", "payload": {"issueId": issue_id}})
     except OSError as error:
         print(f"Paperclip wakeup for issue {issue_id} failed: {error}", file=sys.stderr)
 
 
-def paperclip_watch(issue_id: str, agent_id: str, workflow_id: str) -> None:
-    if workflow_id in active_workflows and workflow_id not in paperclip_watchers:
+def paperclip_watch(issue_id: str, agent_id: str, workflow_id: str, restarted: bool = False) -> None:
+    if (restarted or workflow_id in active_workflows) and workflow_id not in paperclip_watchers:
         paperclip_watchers[workflow_id] = asyncio.create_task(paperclip_wake_when_done(issue_id, agent_id, workflow_id))
         paperclip_watchers[workflow_id].add_done_callback(lambda task: paperclip_watchers.pop(workflow_id, None))
+
+
+def paperclip_rearm(interrupted: set[str]) -> None:
+    """A restart interrupts queued and running workflows, and with them their in-memory watchers. Wake the
+    agent now so each issue reports "interrupted" and how to resume, instead of waiting forever."""
+    if os.environ.get("PAPERCLIP_API_URL") and os.environ.get("PAPERCLIP_API_KEY"):
+        for issue_id, workflow_id in paperclip_issues().items():
+            if workflow_id in interrupted:
+                paperclip_watch(issue_id, "", workflow_id, restarted=True)
 
 
 def paperclip_report(issue_id: str, workflow_id: str, wake: PaperclipWake) -> None:
