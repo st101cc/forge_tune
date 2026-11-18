@@ -546,9 +546,11 @@ async def run_training(run_id: str) -> None:
         process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         active_processes[run_id] = process
         log_path = run_path(run_id).parent / "training.log"
-        with log_path.open("w", encoding="utf-8") as log:
-            while line := await process.stdout.readline():
-                log.write(line.decode(errors="replace"))
+        # Copy raw chunks, not lines: a progress bar redraws with \r and no newline, and a readline() over 64 KiB
+        # raised, left the trainer blocked on a full pipe, and the workflow retried a finished run after 24 hours.
+        with log_path.open("wb") as log:
+            while chunk := await process.stdout.read(65536):
+                log.write(chunk)
                 log.flush()
         code = await process.wait()
         active_processes.pop(run_id, None)
