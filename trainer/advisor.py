@@ -281,7 +281,9 @@ def local_profile(dataset: Dataset) -> dict[str, Any]:
     duplicate_rate = duplicates / max(1, len(valid))
     invalid_rate = len(invalid) / max(1, sample_size)
     code_ratio = code_count / max(1, len(valid))
-    task = "classification" if schema == "classification" else "code" if code_ratio > .22 else "assistant" if schema == "chat" else "structured" if any("{" in value and "}" in value for value in texts[:30]) else "writing"
+    # {{...}} template placeholders (e.g. {{Order Number}} in support replies) are not JSON braces.
+    braced = (re.sub(r"\{\{[^{}]*\}\}", "", value) for value in texts[:30])
+    task = "classification" if schema == "classification" else "code" if code_ratio > .22 else "assistant" if schema == "chat" else "structured" if any("{" in value and "}" in value for value in braced) else "writing"
     confidence = .95 if schema == "classification" else .92 if schema in {"chat", "prompt_completion"} else .74 if schema == "text" else .25
     findings = []
     if not schema:
